@@ -13,6 +13,7 @@ import type {
   ChangeMessage,
   CollectionConfig,
   DeleteMutationFnParams,
+  IR,
   InsertMutationFnParams,
   LoadSubsetOptions,
   SyncConfig,
@@ -647,6 +648,136 @@ export function queryCollectionOptions(
     throw new GetKeyRequiredError()
   }
 
+  // Lazily-derived path of the field that `getKey` reads (e.g. `['id']`).
+  // Used to recognize "load by key" predicates that can be served entirely from
+  // rows we already hold, without issuing a new request.
+  // - undefined: not yet computed
+  // - null: unsupported key shape (composite/derived key) — optimization disabled
+  let cachedKeyFieldPath: Array<string> | null | undefined = undefined
+
+  /**
+   * Determine the field path that `getKey` reads by running it against a
+   * recording proxy. Returns the path for a simple single-field (optionally
+   * nested) key, or null for composite/derived keys where a `where` predicate
+   * can't be reduced to a unique key lookup.
+   */
+  const getKeyFieldPath = (): Array<string> | null => {
+    if (cachedKeyFieldPath !== undefined) {
+      return cachedKeyFieldPath
+    }
+
+    const accessedPaths: Array<Array<string>> = []
+    const makeProxy = (base: Array<string>): any =>
+      new Proxy(
+        {},
+        {
+          get: (_target, prop) => {
+            if (typeof prop !== `string`) {
+              return undefined
+            }
+            const path = [...base, prop]
+            accessedPaths.push(path)
+            return makeProxy(path)
+          },
+        },
+      )
+
+    try {
+      getKey(makeProxy([]) as any)
+    } catch {
+      // getKey transforms/combines fields (e.g. returns a templated string).
+      // Not a plain key lookup — disable the optimization.
+      cachedKeyFieldPath = null
+      return cachedKeyFieldPath
+    }
+
+    if (accessedPaths.length === 0) {
+      cachedKeyFieldPath = null
+      return cachedKeyFieldPath
+    }
+
+    // A single-field (possibly nested) key accesses one property chain, where
+    // each recorded path is a prefix of the longest. Composite keys touch
+    // sibling paths and don't reduce to a single key field.
+    const longestPath = accessedPaths[accessedPaths.length - 1]!
+    const isSingleChain = accessedPaths.every(
+      (path) =>
+        path.length <= longestPath.length &&
+        path.every((segment, i) => segment === longestPath[i]),
+    )
+    cachedKeyFieldPath = isSingleChain ? longestPath : null
+    return cachedKeyFieldPath
+  }
+
+  /**
+   * If `where` is a load-by-key predicate (an `eq`/`in` on the key field, or an
+   * `and` containing one), return the bounded list of key values. The key
+   * equality/membership uniquely bounds the result set, so if every value is
+   * already cached the request can be served locally. Returns null otherwise.
+   */
+  const extractKeyLookupValues = (
+    where: IR.BasicExpression<boolean>,
+  ): Array<string | number> | null => {
+    const keyFieldPath = getKeyFieldPath()
+    if (!keyFieldPath) {
+      return null
+    }
+
+    const refMatchesKey = (expr: IR.BasicExpression | undefined): boolean =>
+      expr?.type === `ref` &&
+      expr.path.length === keyFieldPath.length &&
+      expr.path.every((segment, i) => segment === keyFieldPath[i])
+
+    const valuesFromClause = (
+      clause: IR.BasicExpression<boolean>,
+    ): Array<string | number> | null => {
+      if (clause.type !== `func`) {
+        return null
+      }
+
+      if (clause.name === `eq`) {
+        const [a, b] = clause.args
+        if (refMatchesKey(a) && b?.type === `val`) {
+          return [b.value as string | number]
+        }
+        if (refMatchesKey(b) && a?.type === `val`) {
+          return [a.value as string | number]
+        }
+        return null
+      }
+
+      if (clause.name === `in`) {
+        const [a, b] = clause.args
+        if (refMatchesKey(a) && b?.type === `val` && Array.isArray(b.value)) {
+          return b.value as Array<string | number>
+        }
+        return null
+      }
+
+      return null
+    }
+
+    // Pure `eq` / `in` on the key field.
+    const direct = valuesFromClause(where)
+    if (direct) {
+      return direct
+    }
+
+    // `and(...)` where one conjunct bounds by key. Key equality/membership
+    // bounds the result set to those rows; the remaining conjuncts only narrow
+    // it further, so it can still be served locally once those keys are cached.
+    if (where.type === `func` && where.name === `and`) {
+      for (const arg of where.args) {
+        const fromArg = valuesFromClause(arg as IR.BasicExpression<boolean>)
+        if (fromArg) {
+          return fromArg
+        }
+      }
+    }
+
+    return null
+  }
+
   /** State object to hold error tracking and observer reference */
   const state: QueryCollectionState = {
     lastError: undefined as any,
@@ -1087,6 +1218,22 @@ export function queryCollectionOptions(
           const resumed = createQueryFromOpts(opts, queryFunction)
           return resumed === true ? undefined : resumed
         })
+      }
+
+      // Load-by-key short-circuit: if this request is a lookup by key (get() or
+      // a live query filtering on the key field) and every requested key is
+      // already present in the collection, we already hold authoritative data
+      // for those rows (keys are unique). Skip issuing a new request entirely,
+      // even when the derived query key doesn't match an existing query.
+      if (opts.where) {
+        const keyValues = extractKeyLookupValues(opts.where)
+        if (
+          keyValues &&
+          keyValues.length > 0 &&
+          keyValues.every((keyValue) => collection.has(keyValue))
+        ) {
+          return true
+        }
       }
 
       // Generate key using common function
