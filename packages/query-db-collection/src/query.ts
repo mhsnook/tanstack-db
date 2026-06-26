@@ -34,6 +34,10 @@ import type { StandardSchemaV1 } from '@standard-schema/spec'
 // Re-export for external use
 export type { SyncOperation } from './manual-sync'
 
+// Marker used to read an access path back off the key-introspection proxy
+// (see getKeyFieldPath). Symbol so it can never collide with a real field.
+const KEY_PATH_SYMBOL = Symbol(`keyFieldPath`)
+
 // Schema output type inference helper (matches electric.ts pattern)
 type InferSchemaOutput<T> = T extends StandardSchemaV1
   ? StandardSchemaV1.InferOutput<T> extends object
@@ -648,65 +652,54 @@ export function queryCollectionOptions(
     throw new GetKeyRequiredError()
   }
 
-  // Lazily-derived path of the field that `getKey` reads (e.g. `['id']`).
-  // Used to recognize "load by key" predicates that can be served entirely from
-  // rows we already hold, without issuing a new request.
-  // - undefined: not yet computed
-  // - null: unsupported key shape (composite/derived key) — optimization disabled
+  // Lazily-derived path of the field that `getKey` reads (e.g. `['id']`), used
+  // to recognize "load by key" predicates that can be served from rows we
+  // already hold. Tri-state: undefined = not computed, null = unsupported key
+  // shape (composite/derived key — optimization off), array = the key path.
   let cachedKeyFieldPath: Array<string> | null | undefined = undefined
 
   /**
-   * Determine the field path that `getKey` reads by running it against a
-   * recording proxy. Returns the path for a simple single-field (optionally
-   * nested) key, or null for composite/derived keys where a `where` predicate
-   * can't be reduced to a unique key lookup.
+   * Determine the field path that `getKey` reads by running it against a proxy
+   * whose every property is itself a proxy carrying its own access path. Since
+   * `getKey` returns the proxy sitting at the key field, that returned proxy's
+   * path is the answer. Composite/derived keys return a string (or throw)
+   * rather than a proxy, yielding null and leaving the optimization disabled.
    */
   const getKeyFieldPath = (): Array<string> | null => {
     if (cachedKeyFieldPath !== undefined) {
       return cachedKeyFieldPath
     }
 
-    const accessedPaths: Array<Array<string>> = []
-    const makeProxy = (base: Array<string>): any =>
+    const makeProxy = (path: Array<string>): any =>
       new Proxy(
         {},
         {
-          get: (_target, prop) => {
-            if (typeof prop !== `string`) {
-              return undefined
-            }
-            const path = [...base, prop]
-            accessedPaths.push(path)
-            return makeProxy(path)
-          },
+          get: (_target, prop) =>
+            prop === KEY_PATH_SYMBOL
+              ? path
+              : typeof prop === `string`
+                ? makeProxy([...path, prop])
+                : undefined,
         },
       )
 
+    let keyFieldPath: Array<string> | null = null
     try {
-      getKey(makeProxy([]) as any)
+      const returned = getKey(makeProxy([]) as any) as
+        | { [KEY_PATH_SYMBOL]?: Array<string> }
+        | undefined
+      const path = returned?.[KEY_PATH_SYMBOL]
+      // A non-empty path means `getKey` returned a single key field's proxy.
+      // An empty path means it returned the row itself — not a key lookup.
+      if (Array.isArray(path) && path.length > 0) {
+        keyFieldPath = path
+      }
     } catch {
-      // getKey transforms/combines fields (e.g. returns a templated string).
-      // Not a plain key lookup — disable the optimization.
-      cachedKeyFieldPath = null
-      return cachedKeyFieldPath
+      // `getKey` transforms/combines fields — not a plain key lookup.
     }
 
-    if (accessedPaths.length === 0) {
-      cachedKeyFieldPath = null
-      return cachedKeyFieldPath
-    }
-
-    // A single-field (possibly nested) key accesses one property chain, where
-    // each recorded path is a prefix of the longest. Composite keys touch
-    // sibling paths and don't reduce to a single key field.
-    const longestPath = accessedPaths[accessedPaths.length - 1]!
-    const isSingleChain = accessedPaths.every(
-      (path) =>
-        path.length <= longestPath.length &&
-        path.every((segment, i) => segment === longestPath[i]),
-    )
-    cachedKeyFieldPath = isSingleChain ? longestPath : null
-    return cachedKeyFieldPath
+    cachedKeyFieldPath = keyFieldPath
+    return keyFieldPath
   }
 
   /**
@@ -728,54 +721,42 @@ export function queryCollectionOptions(
       expr.path.length === keyFieldPath.length &&
       expr.path.every((segment, i) => segment === keyFieldPath[i])
 
+    // A key `eq`/`in` clause bounds the result to those keys. The ref is always
+    // the first argument, matching the IR builder convention (see `eq`/`inArray`).
     const valuesFromClause = (
       clause: IR.BasicExpression<boolean>,
     ): Array<string | number> | null => {
-      if (clause.type !== `func`) {
+      if (clause.type !== `func` || !refMatchesKey(clause.args[0])) {
         return null
       }
-
-      if (clause.name === `eq`) {
-        const [a, b] = clause.args
-        if (refMatchesKey(a) && b?.type === `val`) {
-          return [b.value as string | number]
-        }
-        if (refMatchesKey(b) && a?.type === `val`) {
-          return [a.value as string | number]
-        }
-        return null
+      const value = clause.args[1]
+      if (clause.name === `eq` && value?.type === `val`) {
+        return [value.value as string | number]
       }
-
-      if (clause.name === `in`) {
-        const [a, b] = clause.args
-        if (refMatchesKey(a) && b?.type === `val` && Array.isArray(b.value)) {
-          return b.value as Array<string | number>
-        }
-        return null
+      if (
+        clause.name === `in` &&
+        value?.type === `val` &&
+        Array.isArray(value.value)
+      ) {
+        return value.value as Array<string | number>
       }
+      return null
+    }
 
+    // `and(...)` where one conjunct bounds by key: the remaining conjuncts only
+    // narrow the already-bounded set, so it stays cache-servable.
+    if (where.type === `func` && where.name === `and`) {
+      for (const arg of where.args) {
+        const values = valuesFromClause(arg as IR.BasicExpression<boolean>)
+        if (values) {
+          return values
+        }
+      }
       return null
     }
 
     // Pure `eq` / `in` on the key field.
-    const direct = valuesFromClause(where)
-    if (direct) {
-      return direct
-    }
-
-    // `and(...)` where one conjunct bounds by key. Key equality/membership
-    // bounds the result set to those rows; the remaining conjuncts only narrow
-    // it further, so it can still be served locally once those keys are cached.
-    if (where.type === `func` && where.name === `and`) {
-      for (const arg of where.args) {
-        const fromArg = valuesFromClause(arg as IR.BasicExpression<boolean>)
-        if (fromArg) {
-          return fromArg
-        }
-      }
-    }
-
-    return null
+    return valuesFromClause(where)
   }
 
   /** State object to hold error tracking and observer reference */
