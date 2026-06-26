@@ -102,6 +102,24 @@ export interface QueryUnionCollectionConfig<
    * point lookups refresh on a different cadence than list queries.
    */
   itemStaleTime?: number
+
+  /**
+   * Conflict resolution when more than one query contributes the same row.
+   *
+   * Return a monotonically increasing version for a row — typically an
+   * `updated_at` timestamp (ISO string or epoch ms) or a server version
+   * counter. When provided, an incoming row only overwrites the stored row if
+   * its version is greater than or equal to the stored row's version. This
+   * makes the union immune to out-of-order query responses (e.g. a slow broad
+   * query whose response lands *after* a fast point query but reflects an
+   * older snapshot).
+   *
+   * When omitted, the union uses last-write-wins by event arrival order.
+   *
+   * @example getRowVersion: (card) => card.updated_at // ISO string compares lexically
+   * @example getRowVersion: (card) => card.version    // numeric counter
+   */
+  getRowVersion?: (row: T) => number | string
 }
 
 /**
@@ -206,9 +224,19 @@ export function queryUnionCollectionOptions<
     itemQueryKey,
     itemQueryFn,
     itemStaleTime,
+    getRowVersion,
     getKey,
     ...baseCollectionConfig
   } = config
+
+  // A stored row is only overwritten when the incoming row is at least as new.
+  // Without a version hook this is always true (last-write-wins by arrival).
+  const supersedes = (incoming: T, stored: T): boolean => {
+    if (!getRowVersion) return true
+    // Both versions are expected to be the same comparable type (number or
+    // string); `>=` orders numbers numerically and ISO strings lexically.
+    return (getRowVersion(incoming) as any) >= (getRowVersion(stored) as any)
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
   if (!pattern) throw new QueryKeyRequiredError()
@@ -310,10 +338,12 @@ export function queryUnionCollectionOptions<
           rowOwners.set(key, owners)
         }
         owners.add(hash)
-        const existing = collection._state.syncedData.get(key)
+        const existing = collection._state.syncedData.get(key) as T | undefined
         if (!existing) {
           inserts.push(item)
-        } else if (!deepEquals(existing, item)) {
+        } else if (!deepEquals(existing, item) && supersedes(item, existing)) {
+          // Ownership is recorded above regardless; only the *value* is gated
+          // on version, so a stale query still keeps the row alive for gc.
           updates.push(item)
         }
       }

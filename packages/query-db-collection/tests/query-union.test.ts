@@ -185,6 +185,79 @@ describe(`queryUnionCollectionOptions`, () => {
     })
   })
 
+  describe(`getRowVersion conflict resolution`, () => {
+    interface VersionedCard {
+      id: string
+      status: string
+      updated_at: number
+    }
+    const getVersionedKey = (c: VersionedCard) => c.id
+
+    const makeVersionedCollection = () =>
+      createCollection(
+        queryUnionCollectionOptions<VersionedCard>({
+          id: `vcards`,
+          queryClient,
+          queryKey: [`user_card`, WILDCARD],
+          getKey: getVersionedKey,
+          getRowVersion: (c) => c.updated_at,
+          startSync: true,
+        }),
+      )
+
+    it(`does not let a stale, late-arriving query clobber newer data`, async () => {
+      const collection = makeVersionedCollection()
+
+      // Fast point query lands first with the NEWER row (updated_at: 200).
+      await queryClient.ensureQueryData({
+        queryKey: [`user_card`, `id`, `5`],
+        queryFn: (): Array<VersionedCard> => [
+          { id: `5`, status: `skipped`, updated_at: 200 },
+        ],
+      })
+      await vi.waitFor(() => expect(collection.get(`5`)?.status).toBe(`skipped`))
+
+      // Broad query resolves LATER but reflects an OLDER snapshot (updated_at: 100).
+      await queryClient.ensureQueryData({
+        queryKey: [`user_card`, `uid`, `u1`],
+        queryFn: (): Array<VersionedCard> => [
+          { id: `5`, status: `new`, updated_at: 100 },
+          { id: `6`, status: `new`, updated_at: 100 },
+        ],
+      })
+
+      await vi.waitFor(() => expect(collection.has(`6`)).toBe(true))
+      // Row 5 keeps the newer value; the stale broad snapshot is rejected.
+      expect(collection.get(`5`)?.status).toBe(`skipped`)
+      expect(collection.get(`5`)?.updated_at).toBe(200)
+      // ...but row 6 (new info, not a conflict) is still inserted.
+      expect(collection.get(`6`)?.status).toBe(`new`)
+    })
+
+    it(`applies a genuinely newer version from any query`, async () => {
+      const collection = makeVersionedCollection()
+
+      await queryClient.ensureQueryData({
+        queryKey: [`user_card`, `uid`, `u1`],
+        queryFn: (): Array<VersionedCard> => [
+          { id: `5`, status: `new`, updated_at: 100 },
+        ],
+      })
+      await vi.waitFor(() => expect(collection.get(`5`)?.status).toBe(`new`))
+
+      await queryClient.ensureQueryData({
+        queryKey: [`user_card`, `id`, `5`],
+        queryFn: (): Array<VersionedCard> => [
+          { id: `5`, status: `skipped`, updated_at: 300 },
+        ],
+      })
+      await vi.waitFor(() =>
+        expect(collection.get(`5`)?.status).toBe(`skipped`),
+      )
+      expect(collection.get(`5`)?.updated_at).toBe(300)
+    })
+  })
+
   describe(`utils.ensureItem`, () => {
     it(`returns a present item without fetching`, async () => {
       const itemQueryFn = vi.fn(
