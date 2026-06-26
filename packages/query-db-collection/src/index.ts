@@ -9,6 +9,14 @@ export {
   type SyncOperation,
 } from './query'
 
+export {
+  queryUnionCollectionOptions,
+  keyMatchesPattern,
+  WILDCARD,
+  type QueryUnionCollectionConfig,
+  type QueryUnionCollectionUtils,
+} from './query-union'
+
 export * from './errors'
 
 // Re-export expression helpers from @tanstack/db
