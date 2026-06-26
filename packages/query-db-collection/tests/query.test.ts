@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { QueryClient, hashKey } from '@tanstack/query-core'
 import {
   BTreeIndex,
+  and,
   createCollection,
   createLiveQueryCollection,
   eq,
@@ -6592,6 +6593,46 @@ describe(`QueryCollection`, () => {
 
       listQuery.cleanup()
       byKeyQuery.cleanup()
+    })
+
+    it(`does not short-circuit when the key clause is nested inside an or`, async () => {
+      const queryFn = makeQueryFn()
+      const collection = createOnDemandCollection(`short-circuit-or`, queryFn)
+
+      const listQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => eq(item.category, `A`)),
+      })
+      await listQuery.preload()
+      await vi.waitFor(() => {
+        expect(collection.has(`1`)).toBe(true)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // The key eq is buried in an `or` branch, so the result also depends on the
+      // `category = 'B'` branch, which we have NOT loaded. The cache is not
+      // authoritative here, so a request must still be issued.
+      const orQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) =>
+              or(
+                eq(item.category, `B`),
+                and(eq(item.id, `1`), eq(item.category, `A`)),
+              ),
+            ),
+      })
+      await orQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+      })
+
+      listQuery.cleanup()
+      orQuery.cleanup()
     })
 
     it(`still issues a request when only some keys in an inArray lookup are cached`, async () => {
