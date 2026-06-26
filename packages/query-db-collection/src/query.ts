@@ -34,8 +34,8 @@ import type { StandardSchemaV1 } from '@standard-schema/spec'
 // Re-export for external use
 export type { SyncOperation } from './manual-sync'
 
-// Marker used to read an access path back off the key-introspection proxy
-// (see getKeyFieldPath). Symbol so it can never collide with a real field.
+// Lets getKeyFieldPath read a path back off its proxy; a symbol so it can't
+// collide with a real field name.
 const KEY_PATH_SYMBOL = Symbol(`keyFieldPath`)
 
 // Schema output type inference helper (matches electric.ts pattern)
@@ -652,24 +652,26 @@ export function queryCollectionOptions(
     throw new GetKeyRequiredError()
   }
 
-  // Lazily-derived path of the field that `getKey` reads (e.g. `['id']`), used
-  // to recognize "load by key" predicates that can be served from rows we
-  // already hold. Tri-state: undefined = not computed, null = unsupported key
-  // shape (composite/derived key — optimization off), array = the key path.
+  // ===========================================================================
+  // NOTE: everything down to extractKeyLookupValues exists ONLY because a
+  // collection has no `collection.key` to read — the key is an opaque
+  // `getKey(item)` function. So we reverse-engineer the key's field path by
+  // running getKey against a proxy. If collections ever expose the key path,
+  // delete getKeyFieldPath and read it directly.
+  // ===========================================================================
+
+  // getKey's field path (e.g. ['id']), derived once and cached. Tri-state:
+  // undefined = not computed; null = composite/derived key we can't reduce to a
+  // single field (optimization off); array = the key path.
   let cachedKeyFieldPath: Array<string> | null | undefined = undefined
 
-  /**
-   * Determine the field path that `getKey` reads by running it against a proxy
-   * whose every property is itself a proxy carrying its own access path. Since
-   * `getKey` returns the proxy sitting at the key field, that returned proxy's
-   * path is the answer. Composite/derived keys return a string (or throw)
-   * rather than a proxy, yielding null and leaving the optimization disabled.
-   */
   const getKeyFieldPath = (): Array<string> | null => {
     if (cachedKeyFieldPath !== undefined) {
       return cachedKeyFieldPath
     }
 
+    // Each property access returns a child proxy carrying its own path; getKey
+    // returns the proxy at the key field, so we read the path back off it.
     const makeProxy = (path: Array<string>): any =>
       new Proxy(
         {},
@@ -689,25 +691,24 @@ export function queryCollectionOptions(
         | { [KEY_PATH_SYMBOL]?: Array<string> }
         | undefined
       const path = returned?.[KEY_PATH_SYMBOL]
-      // A non-empty path means `getKey` returned a single key field's proxy.
-      // An empty path means it returned the row itself — not a key lookup.
+      // Empty path = getKey returned the row itself; a non-proxy return (or a
+      // throw) = a derived/composite key. Neither is a single-field key.
       if (Array.isArray(path) && path.length > 0) {
         keyFieldPath = path
       }
     } catch {
-      // `getKey` transforms/combines fields — not a plain key lookup.
+      // getKey combines/transforms fields — not a plain key lookup.
     }
 
     cachedKeyFieldPath = keyFieldPath
     return keyFieldPath
   }
 
-  /**
-   * If `where` is a load-by-key predicate (an `eq`/`in` on the key field, or an
-   * `and` containing one), return the bounded list of key values. The key
-   * equality/membership uniquely bounds the result set, so if every value is
-   * already cached the request can be served locally. Returns null otherwise.
-   */
+  // ─── here's where the functionality sort of starts ───────────────────────
+  // Given the key field path, pull the key value(s) out of a load-by-key
+  // `where`: a bare `eq`/`in` on the key, or an `and(...)` containing one.
+  // Returns null when it isn't a key lookup. Consumed by the opts.where
+  // short-circuit in createQueryFromOpts.
   const extractKeyLookupValues = (
     where: IR.BasicExpression<boolean>,
   ): Array<string | number> | null => {
@@ -716,13 +717,13 @@ export function queryCollectionOptions(
       return null
     }
 
+    // Does this ref point at the key field?
     const refMatchesKey = (expr: IR.BasicExpression | undefined): boolean =>
       expr?.type === `ref` &&
       expr.path.length === keyFieldPath.length &&
       expr.path.every((segment, i) => segment === keyFieldPath[i])
 
-    // A key `eq`/`in` clause bounds the result to those keys. The ref is always
-    // the first argument, matching the IR builder convention (see `eq`/`inArray`).
+    // Key value(s) from one clause. Ref is always arg 0 (IR builder convention).
     const valuesFromClause = (
       clause: IR.BasicExpression<boolean>,
     ): Array<string | number> | null => {
@@ -743,8 +744,7 @@ export function queryCollectionOptions(
       return null
     }
 
-    // `and(...)` where one conjunct bounds by key: the remaining conjuncts only
-    // narrow the already-bounded set, so it stays cache-servable.
+    // In an `and(...)`, one key conjunct bounds the set; the rest only narrow it.
     if (where.type === `func` && where.name === `and`) {
       for (const arg of where.args) {
         const values = valuesFromClause(arg as IR.BasicExpression<boolean>)
@@ -755,7 +755,6 @@ export function queryCollectionOptions(
       return null
     }
 
-    // Pure `eq` / `in` on the key field.
     return valuesFromClause(where)
   }
 
@@ -1201,11 +1200,9 @@ export function queryCollectionOptions(
         })
       }
 
-      // Load-by-key short-circuit: if this request is a lookup by key (get() or
-      // a live query filtering on the key field) and every requested key is
-      // already present in the collection, we already hold authoritative data
-      // for those rows (keys are unique). Skip issuing a new request entirely,
-      // even when the derived query key doesn't match an existing query.
+      // Load-by-key short-circuit: a lookup by key whose keys we already hold is
+      // authoritative (keys are unique), so skip the request — even when the
+      // derived query key doesn't match an existing query.
       if (opts.where) {
         const keyValues = extractKeyLookupValues(opts.where)
         if (
