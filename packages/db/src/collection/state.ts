@@ -800,10 +800,16 @@ export class CollectionStateManager<
    * This method processes operations from pending transactions and applies them to the synced data
    */
   commitPendingTransactions = () => {
-    // Check if there are any persisting transaction
+    // Check if there are any persisting transaction. `accepted` is a sub-phase of persisting (the
+    // mutationFn is still running, the overlay is still applied), so it gates sync commits the same
+    // way `persisting` does – a transaction that reports acceptance behaves identically to one that
+    // doesn't until its mutationFn resolves.
     let hasPersistingTransaction = false
     for (const transaction of this.transactions.values()) {
-      if (transaction.state === `persisting`) {
+      if (
+        transaction.state === `persisting` ||
+        transaction.state === `accepted`
+      ) {
         hasPersistingTransaction = true
         break
       }

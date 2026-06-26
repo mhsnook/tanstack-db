@@ -615,3 +615,154 @@ describe(`Transactions`, () => {
     })
   })
 })
+
+describe(`Transaction acceptance (three-step settlement)`, () => {
+  const makeCollection = (id: string) =>
+    createCollection<{ id: number; value: string }>({
+      id,
+      getKey: (item) => item.id,
+      sync: {
+        sync: () => {},
+      },
+    })
+
+  it(`transitions through accepted before completed when setAccepted is called`, async () => {
+    const states: Array<string> = []
+    let releaseSync: () => void = () => {}
+    const syncEcho = new Promise<void>((resolve) => {
+      releaseSync = resolve
+    })
+
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async ({ transaction: tx }) => {
+        // Step 2: server durably accepted the write (e.g. POST 200)
+        tx.setAccepted()
+        // Step 3: wait for the change to echo back over the sync stream
+        await syncEcho
+      },
+    })
+    const collection = makeCollection(`accept-1`)
+
+    transaction.onStateChange((state) => states.push(state))
+
+    transaction.mutate(() => {
+      collection.insert({ id: 1, value: `a` })
+    })
+
+    const commitPromise = transaction.commit()
+
+    // Acceptance resolves as soon as setAccepted() runs, while the mutationFn is still pending.
+    await expect(transaction.isAccepted.promise).resolves.toBe(transaction)
+    expect(transaction.state).toBe(`accepted`)
+
+    // Now let the sync echo resolve the mutationFn -> completed.
+    releaseSync()
+    await commitPromise
+
+    await expect(transaction.isPersisted.promise).resolves.toBe(transaction)
+    expect(transaction.state).toBe(`completed`)
+    expect(states).toEqual([`persisting`, `accepted`, `completed`])
+  })
+
+  it(`resolves isAccepted at completion even if setAccepted is never called`, async () => {
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async () => Promise.resolve(),
+    })
+    const collection = makeCollection(`accept-2`)
+
+    transaction.mutate(() => {
+      collection.insert({ id: 1, value: `a` })
+    })
+    await transaction.commit()
+
+    // Backstop: isAccepted never hangs, it resolves alongside completion.
+    await expect(transaction.isAccepted.promise).resolves.toBe(transaction)
+    await expect(transaction.isPersisted.promise).resolves.toBe(transaction)
+    expect(transaction.state).toBe(`completed`)
+  })
+
+  it(`resolves isAccepted for an empty (no-mutation) transaction`, async () => {
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async () => Promise.resolve(),
+    })
+
+    await transaction.commit()
+
+    await expect(transaction.isAccepted.promise).resolves.toBe(transaction)
+    expect(transaction.state).toBe(`completed`)
+  })
+
+  it(`rejects isAccepted when the transaction is rolled back before acceptance`, async () => {
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async () => {
+        await Promise.resolve()
+        throw new Error(`bad`)
+      },
+    })
+    const collection = makeCollection(`accept-3`)
+
+    transaction.mutate(() => {
+      collection.insert({ id: 1, value: `a` })
+    })
+
+    await expect(transaction.commit()).rejects.toThrow(`bad`)
+    await expect(transaction.isAccepted.promise).rejects.toThrow(`bad`)
+    await expect(transaction.isPersisted.promise).rejects.toThrow(`bad`)
+    expect(transaction.state).toBe(`failed`)
+  })
+
+  it(`rejects isAccepted on a manual rollback`, async () => {
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async () => Promise.resolve(),
+    })
+    const collection = makeCollection(`accept-4`)
+
+    transaction.mutate(() => {
+      collection.insert({ id: 1, value: `a` })
+    })
+    transaction.rollback()
+
+    await expect(transaction.isAccepted.promise).rejects.toBeUndefined()
+    // isPersisted rejects too; swallow it so it doesn't surface as unhandled.
+    transaction.isPersisted.promise.catch(() => {})
+    expect(transaction.state).toBe(`failed`)
+  })
+
+  it(`setAccepted is a no-op outside of the persisting phase`, async () => {
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async () => Promise.resolve(),
+    })
+
+    // Before commit: pending -> no-op, no state change, isAccepted still pending.
+    expect(transaction.setAccepted()).toBe(transaction)
+    expect(transaction.state).toBe(`pending`)
+    expect(transaction.isAccepted.isPending()).toBe(true)
+
+    await transaction.commit()
+    expect(transaction.state).toBe(`completed`)
+
+    // After completion: no-op, stays completed.
+    transaction.setAccepted()
+    expect(transaction.state).toBe(`completed`)
+  })
+
+  it(`onStateChange returns an unsubscribe that stops further notifications`, async () => {
+    const states: Array<string> = []
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: async () => Promise.resolve(),
+    })
+
+    const unsubscribe = transaction.onStateChange((state) => states.push(state))
+    unsubscribe()
+
+    await transaction.commit()
+    expect(states).toEqual([])
+  })
+})

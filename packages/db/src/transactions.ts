@@ -14,6 +14,7 @@ import type {
   PendingMutation,
   TransactionConfig,
   TransactionState,
+  TransactionStateChangeListener,
   TransactionWithMutations,
 } from './types'
 
@@ -211,7 +212,22 @@ class Transaction<T extends object = Record<string, unknown>> {
   public state: TransactionState
   public mutationFn: MutationFn<T>
   public mutations: Array<PendingMutation<T>>
+  /**
+   * Resolves when the transaction has fully settled – the `mutationFn` resolved, the
+   * transaction reached `completed`, and the optimistic overlay has dropped onto synced data.
+   * Rejects when the transaction is rolled back.
+   */
   public isPersisted: Deferred<Transaction<T>>
+  /**
+   * Resolves when the transaction is *accepted* – the optional mid-flight checkpoint reported by
+   * a `mutationFn` via {@link Transaction.setAccepted} (e.g. the server returned 200 but the
+   * synced data has not echoed back yet).
+   *
+   * Invariant: `isAccepted` always settles no later than `isPersisted`. A `mutationFn` that never
+   * calls `setAccepted()` still has `isAccepted` resolve automatically the moment the transaction
+   * completes, so consumers awaiting it never hang. On rollback it rejects alongside `isPersisted`.
+   */
+  public isAccepted: Deferred<Transaction<T>>
   public autoCommit: boolean
   public createdAt: Date
   public sequenceNumber: number
@@ -220,6 +236,7 @@ class Transaction<T extends object = Record<string, unknown>> {
     message: string
     error: Error
   }
+  private stateChangeListeners: Set<TransactionStateChangeListener<T>>
 
   constructor(config: TransactionConfig<T>) {
     if (typeof config.mutationFn === `undefined`) {
@@ -230,18 +247,89 @@ class Transaction<T extends object = Record<string, unknown>> {
     this.state = `pending`
     this.mutations = []
     this.isPersisted = createDeferred<Transaction<T>>()
+    this.isAccepted = createDeferred<Transaction<T>>()
+    // `isAccepted` is opt-in: many transactions will never have a consumer awaiting it, yet it
+    // still rejects on rollback. Attach a no-op handler so an unconsumed rejection doesn't surface
+    // as an unhandled promise rejection. Consumers that do `await isAccepted.promise` still observe
+    // the rejection on their own derived promise.
+    this.isAccepted.promise.catch(() => {})
     this.autoCommit = config.autoCommit ?? true
     this.createdAt = new Date()
     this.sequenceNumber = sequenceNumber++
     this.metadata = config.metadata ?? {}
+    this.stateChangeListeners = new Set()
   }
 
   setState(newState: TransactionState) {
+    const previousState = this.state
     this.state = newState
 
     if (newState === `completed` || newState === `failed`) {
       removeFromPendingList(this)
     }
+
+    if (newState !== previousState) {
+      for (const listener of this.stateChangeListeners) {
+        listener(newState, this)
+      }
+    }
+  }
+
+  /**
+   * Subscribe to state transitions of this transaction.
+   *
+   * The listener is called after each transition (`pending` → `persisting` → `accepted` →
+   * `completed` / `failed`) with the new state. Useful for devtools, external observers, or any
+   * code holding a transaction that needs to react to its progress from outside the `mutationFn`.
+   *
+   * @param listener - Called with the new state and this transaction on every transition.
+   * @returns An unsubscribe function that removes the listener.
+   * @example
+   * const unsubscribe = tx.onStateChange((state) => {
+   *   console.log(`transaction is now ${state}`)
+   * })
+   * // later
+   * unsubscribe()
+   */
+  onStateChange(listener: TransactionStateChangeListener<T>): () => void {
+    this.stateChangeListeners.add(listener)
+    return () => {
+      this.stateChangeListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Report the *accepted* checkpoint from within a `mutationFn`.
+   *
+   * Call this once the server has durably accepted the write but before the synced data has
+   * echoed back (e.g. right after a POST returns 200, before awaiting the change over a
+   * websocket). This transitions the transaction to the `accepted` state and resolves
+   * {@link Transaction.isAccepted}, while the optimistic overlay stays applied – giving a
+   * flicker-free "saved ✓ · syncing…" window until the `mutationFn` resolves.
+   *
+   * It is a no-op unless the transaction is currently `persisting` (i.e. inside `commit()` /
+   * the `mutationFn`), so calling it before commit or after completion is safe and ignored.
+   *
+   * @returns This transaction for chaining.
+   * @example
+   * const tx = createTransaction({
+   *   mutationFn: async ({ transaction }) => {
+   *     const ack = await api.send(transaction.mutations) // server 200
+   *     transaction.setAccepted()                         // overlay still held
+   *     await api.waitForSync(ack.txid)                   // wait for the echo
+   *     // mutationFn resolves -> completed -> overlay drops onto synced row
+   *   },
+   * })
+   */
+  setAccepted(): Transaction<T> {
+    if (this.state !== `persisting`) {
+      return this
+    }
+    this.setState(`accepted`)
+    if (this.isAccepted.isPending()) {
+      this.isAccepted.resolve(this)
+    }
+    return this
   }
 
   /**
@@ -415,8 +503,12 @@ class Transaction<T extends object = Record<string, unknown>> {
       }
     }
 
-    // Reject the promise
+    // Reject the promises. If acceptance was never reported, it fails alongside persistence so
+    // consumers awaiting `isAccepted.promise` don't hang on a rolled-back transaction.
     this.isPersisted.reject(this.error?.error)
+    if (this.isAccepted.isPending()) {
+      this.isAccepted.reject(this.error?.error)
+    }
     this.touchCollection()
 
     return this
@@ -486,6 +578,10 @@ class Transaction<T extends object = Record<string, unknown>> {
     this.setState(`persisting`)
 
     if (this.mutations.length === 0) {
+      // Nothing to persist: acceptance and persistence happen simultaneously.
+      if (this.isAccepted.isPending()) {
+        this.isAccepted.resolve(this)
+      }
       this.setState(`completed`)
       this.isPersisted.resolve(this)
 
@@ -500,6 +596,13 @@ class Transaction<T extends object = Record<string, unknown>> {
       await this.mutationFn({
         transaction: this as unknown as TransactionWithMutations<T>,
       })
+
+      // Backstop the `isAccepted` invariant: a `mutationFn` that never called `setAccepted()`
+      // still resolves acceptance at completion, so consumers awaiting `isAccepted.promise`
+      // never hang. (`isAccepted` always settles no later than `isPersisted`.)
+      if (this.isAccepted.isPending()) {
+        this.isAccepted.resolve(this)
+      }
 
       this.setState(`completed`)
       this.touchCollection()

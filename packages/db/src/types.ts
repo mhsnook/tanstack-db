@@ -61,7 +61,37 @@ export type InferSchemaInput<T> = T extends StandardSchemaV1
     : Record<string, unknown>
   : Record<string, unknown>
 
-export type TransactionState = `pending` | `persisting` | `completed` | `failed`
+/**
+ * The lifecycle states of a {@link Transaction}.
+ *
+ * The progression is:
+ *
+ * `pending` → `persisting` → (`accepted`) → `completed`  on success
+ * `pending` → `persisting` → (`accepted`) → `failed`     on rollback / error
+ *
+ * - `pending` – mutations have been applied optimistically but `commit()` has not run.
+ * - `persisting` – `commit()` is running the `mutationFn`; the optimistic overlay is still applied.
+ * - `accepted` – an *optional* checkpoint a `mutationFn` may report (via
+ *   {@link Transaction.setAccepted}) once the server has durably accepted the write but the
+ *   synced data has not yet echoed back. The optimistic overlay is still applied, so this is the
+ *   moment for a "saved ✓ · syncing…" state with no flicker. Transactions that never call
+ *   `setAccepted()` skip this state entirely and behave exactly as before.
+ * - `completed` – the `mutationFn` resolved; the optimistic overlay drops onto the synced truth.
+ * - `failed` – the `mutationFn` threw and the transaction was rolled back.
+ */
+export type TransactionState =
+  | `pending`
+  | `persisting`
+  | `accepted`
+  | `completed`
+  | `failed`
+
+/**
+ * Listener invoked whenever a {@link Transaction} transitions to a new {@link TransactionState}.
+ */
+export type TransactionStateChangeListener<
+  T extends object = Record<string, unknown>,
+> = (state: TransactionState, transaction: Transaction<T>) => void
 
 /**
  * Represents a utility function that can be attached to a collection
