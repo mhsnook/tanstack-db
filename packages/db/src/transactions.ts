@@ -211,9 +211,28 @@ class Transaction<T extends object = Record<string, unknown>> {
   public state: TransactionState
   public mutationFn: MutationFn<T>
   public mutations: Array<PendingMutation<T>>
+  /**
+   * @deprecated Prefer {@link Transaction.isSettled}. `isPersisted` is the **same
+   * `Deferred` object** as `isSettled` (`tx.isPersisted === tx.isSettled`), kept for
+   * backwards compatibility — so the settled milestone reads in parallel with the
+   * acknowledged one (`isAcknowledged`/`isSettled`) and the two can never diverge.
+   */
   public isPersisted: Deferred<Transaction<T>>
+  /**
+   * Resolves when the write has fully *settled* — synced back so the optimistic
+   * overlay is dropped. Rejects if the transaction fails. Exact synonym of the
+   * (deprecated) `isPersisted`.
+   */
+  public isSettled: Deferred<Transaction<T>>
   public isAcknowledged: Deferred<Transaction<T>>
   public acknowledged: boolean
+  /**
+   * A framework-owned settle step registered via {@link Transaction.settleWith}.
+   * When set, `commit()` awaits it (keeping the transaction in `persisting`, so
+   * the optimistic overlay is held) after the handler returns, before settling.
+   * @internal
+   */
+  public settleFn?: () => Promise<unknown>
   public autoCommit: boolean
   public createdAt: Date
   public sequenceNumber: number
@@ -231,12 +250,17 @@ class Transaction<T extends object = Record<string, unknown>> {
     this.mutationFn = config.mutationFn
     this.state = `pending`
     this.mutations = []
-    this.isPersisted = createDeferred<Transaction<T>>()
+    this.isSettled = createDeferred<Transaction<T>>()
+    // isPersisted is an exact alias of isSettled — the same Deferred, so they can
+    // never diverge in value or timing. Resolve/reject isSettled and isPersisted
+    // follows automatically.
+    this.isPersisted = this.isSettled
     this.isAcknowledged = createDeferred<Transaction<T>>()
     this.acknowledged = false
-    // Prevent unhandled-rejection noise when nobody awaits isAcknowledged on a
-    // failing transaction; explicit awaiters still observe the rejection.
+    // Prevent unhandled-rejection noise when nobody awaits these on a failing
+    // transaction; explicit awaiters still observe the rejection.
     void this.isAcknowledged.promise.catch(() => {})
+    void this.isSettled.promise.catch(() => {})
     this.autoCommit = config.autoCommit ?? true
     this.createdAt = new Date()
     this.sequenceNumber = sequenceNumber++
@@ -427,7 +451,10 @@ class Transaction<T extends object = Record<string, unknown>> {
     if (this.isAcknowledged.isPending()) {
       this.isAcknowledged.reject(this.error?.error)
     }
-    this.isPersisted.reject(this.error?.error)
+    if (this.isSettled.isPending()) {
+      // isPersisted is the same Deferred, so this rejects both.
+      this.isSettled.reject(this.error?.error)
+    }
     this.touchCollection()
 
     return this
@@ -491,6 +518,25 @@ class Transaction<T extends object = Record<string, unknown>> {
   }
 
   /**
+   * Hand the *settle* step to the framework instead of blocking the handler.
+   *
+   * A collection adapter calls this with a thunk that resolves once the write
+   * has synced back (e.g. awaiting a txid in the replication stream). The handler
+   * can then return at the ack; `commit()` keeps the transaction in `persisting`
+   * (so the optimistic overlay is held — no flicker) until the thunk resolves,
+   * then settles: drops the overlay and resolves `isSettled` / `isPersisted`.
+   *
+   * If the thunk rejects, the transaction fails and rolls back, exactly as a
+   * throwing handler would. No-op timing change for `isAcknowledged`, which the
+   * adapter should resolve via {@link Transaction.acknowledge} before returning.
+   * @returns This transaction for chaining
+   */
+  settleWith(fn: () => Promise<unknown>): Transaction<T> {
+    this.settleFn = fn
+    return this
+  }
+
+  /**
    * Commit the transaction and execute the mutation function
    * @returns Promise that resolves to this transaction when complete
    * @example
@@ -542,7 +588,8 @@ class Transaction<T extends object = Record<string, unknown>> {
         this.acknowledged = true
         this.isAcknowledged.resolve(this)
       }
-      this.isPersisted.resolve(this)
+      // isPersisted is the same Deferred, so this resolves both.
+      this.isSettled.resolve(this)
 
       return this
     }
@@ -556,6 +603,13 @@ class Transaction<T extends object = Record<string, unknown>> {
         transaction: this as unknown as TransactionWithMutations<T>,
       })
 
+      // If the adapter handed the settle step to the framework, await it while
+      // still `persisting` so the optimistic overlay is held (no flicker) until
+      // the change has synced back.
+      if (this.settleFn) {
+        await this.settleFn()
+      }
+
       this.setState(`completed`)
       this.touchCollection()
 
@@ -566,7 +620,8 @@ class Transaction<T extends object = Record<string, unknown>> {
         this.acknowledged = true
         this.isAcknowledged.resolve(this)
       }
-      this.isPersisted.resolve(this)
+      // isPersisted is the same Deferred, so this resolves both.
+      this.isSettled.resolve(this)
     } catch (error) {
       // Preserve the original error for rethrowing
       const originalError =

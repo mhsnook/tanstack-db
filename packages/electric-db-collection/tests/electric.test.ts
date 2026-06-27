@@ -606,6 +606,7 @@ describe(`Electric Integration`, () => {
         id: `test-transaction`,
         mutations: [],
         acknowledge: vi.fn(),
+        settleWith: vi.fn(),
       } as unknown as TransactionWithMutations<Row, `insert`>
       const mockParams: InsertMutationFnParams<
         Row,
