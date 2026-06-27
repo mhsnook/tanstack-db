@@ -236,7 +236,9 @@ class Transaction<T extends object = Record<string, unknown>> {
     message: string
     error: Error
   }
-  private stateChangeListeners: Set<TransactionStateChangeListener<T>>
+  // Allocated lazily on first `onStateChange` subscription – most transactions never have a
+  // listener, so we avoid a Set allocation per transaction on this high-volume path.
+  private stateChangeListeners?: Set<TransactionStateChangeListener<T>>
 
   constructor(config: TransactionConfig<T>) {
     if (typeof config.mutationFn === `undefined`) {
@@ -257,7 +259,20 @@ class Transaction<T extends object = Record<string, unknown>> {
     this.createdAt = new Date()
     this.sequenceNumber = sequenceNumber++
     this.metadata = config.metadata ?? {}
-    this.stateChangeListeners = new Set()
+  }
+
+  // Resolve/reject `isAccepted` only if it hasn't settled yet, preserving the invariant that it
+  // settles exactly once and no later than `isPersisted`.
+  private resolveAccepted(): void {
+    if (this.isAccepted.isPending()) {
+      this.isAccepted.resolve(this)
+    }
+  }
+
+  private rejectAccepted(reason?: Error | unknown): void {
+    if (this.isAccepted.isPending()) {
+      this.isAccepted.reject(reason)
+    }
   }
 
   setState(newState: TransactionState) {
@@ -268,7 +283,7 @@ class Transaction<T extends object = Record<string, unknown>> {
       removeFromPendingList(this)
     }
 
-    if (newState !== previousState) {
+    if (newState !== previousState && this.stateChangeListeners) {
       for (const listener of this.stateChangeListeners) {
         listener(newState, this)
       }
@@ -292,9 +307,10 @@ class Transaction<T extends object = Record<string, unknown>> {
    * unsubscribe()
    */
   onStateChange(listener: TransactionStateChangeListener<T>): () => void {
-    this.stateChangeListeners.add(listener)
+    const listeners = (this.stateChangeListeners ??= new Set())
+    listeners.add(listener)
     return () => {
-      this.stateChangeListeners.delete(listener)
+      this.stateChangeListeners?.delete(listener)
     }
   }
 
@@ -326,9 +342,7 @@ class Transaction<T extends object = Record<string, unknown>> {
       return this
     }
     this.setState(`accepted`)
-    if (this.isAccepted.isPending()) {
-      this.isAccepted.resolve(this)
-    }
+    this.resolveAccepted()
     return this
   }
 
@@ -506,9 +520,7 @@ class Transaction<T extends object = Record<string, unknown>> {
     // Reject the promises. If acceptance was never reported, it fails alongside persistence so
     // consumers awaiting `isAccepted.promise` don't hang on a rolled-back transaction.
     this.isPersisted.reject(this.error?.error)
-    if (this.isAccepted.isPending()) {
-      this.isAccepted.reject(this.error?.error)
-    }
+    this.rejectAccepted(this.error?.error)
     this.touchCollection()
 
     return this
@@ -579,9 +591,7 @@ class Transaction<T extends object = Record<string, unknown>> {
 
     if (this.mutations.length === 0) {
       // Nothing to persist: acceptance and persistence happen simultaneously.
-      if (this.isAccepted.isPending()) {
-        this.isAccepted.resolve(this)
-      }
+      this.resolveAccepted()
       this.setState(`completed`)
       this.isPersisted.resolve(this)
 
@@ -600,9 +610,7 @@ class Transaction<T extends object = Record<string, unknown>> {
       // Backstop the `isAccepted` invariant: a `mutationFn` that never called `setAccepted()`
       // still resolves acceptance at completion, so consumers awaiting `isAccepted.promise`
       // never hang. (`isAccepted` always settles no later than `isPersisted`.)
-      if (this.isAccepted.isPending()) {
-        this.isAccepted.resolve(this)
-      }
+      this.resolveAccepted()
 
       this.setState(`completed`)
       this.touchCollection()
