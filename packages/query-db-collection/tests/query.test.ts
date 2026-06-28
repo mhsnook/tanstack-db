@@ -6488,8 +6488,7 @@ describe(`QueryCollection`, () => {
         queryCollectionOptions({
           id,
           queryClient,
-          queryKey: (ctx: any) =>
-            ctx.where ? [id, ctx.where] : [id],
+          queryKey: (ctx: any) => (ctx.where ? [id, ctx.where] : [id]),
           queryFn,
           getKey,
           startSync: true,
@@ -6497,11 +6496,11 @@ describe(`QueryCollection`, () => {
         } as QueryCollectionConfig<CategorisedItem>),
       )
 
-    it(`does not issue a new request for an eq key lookup when the key is already cached`, async () => {
+    // Every test starts from the same state: a category A list query loaded
+    // (items 1 and 2 in the collection) via a single queryFn call.
+    const setupWithCategoryAListLoaded = async (id: string) => {
       const queryFn = makeQueryFn()
-      const collection = createOnDemandCollection(`short-circuit-eq`, queryFn)
-
-      // Load the category A list, which loads items 1 and 2 into the collection.
+      const collection = createOnDemandCollection(id, queryFn)
       const listQuery = createLiveQueryCollection({
         query: (q) =>
           q
@@ -6513,6 +6512,12 @@ describe(`QueryCollection`, () => {
         expect(collection.has(`1`)).toBe(true)
       })
       expect(queryFn).toHaveBeenCalledTimes(1)
+      return { collection, queryFn, listQuery }
+    }
+
+    it(`does not issue a new request for an eq key lookup when the key is already cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-eq`)
 
       // A by-key live query for an already-cached key must reuse the cached row
       // and NOT trigger a new request, even though its query key differs.
@@ -6531,21 +6536,9 @@ describe(`QueryCollection`, () => {
     })
 
     it(`does not issue a new request for an inArray key lookup when all keys are cached`, async () => {
-      const queryFn = makeQueryFn()
-      const collection = createOnDemandCollection(`short-circuit-in`, queryFn)
-
-      const listQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }) => eq(item.category, `A`)),
-      })
-      await listQuery.preload()
-      await vi.waitFor(() => {
-        expect(collection.has(`1`)).toBe(true)
-        expect(collection.has(`2`)).toBe(true)
-      })
-      expect(queryFn).toHaveBeenCalledTimes(1)
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-in`)
+      expect(collection.has(`2`)).toBe(true)
 
       const byKeysQuery = createLiveQueryCollection({
         query: (q) =>
@@ -6563,20 +6556,8 @@ describe(`QueryCollection`, () => {
     })
 
     it(`still issues a request for a key lookup when the key is not cached`, async () => {
-      const queryFn = makeQueryFn()
-      const collection = createOnDemandCollection(`short-circuit-miss`, queryFn)
-
-      const listQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }) => eq(item.category, `A`)),
-      })
-      await listQuery.preload()
-      await vi.waitFor(() => {
-        expect(collection.has(`1`)).toBe(true)
-      })
-      expect(queryFn).toHaveBeenCalledTimes(1)
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-miss`)
 
       // Item 3 (category B) was never loaded, so a by-key lookup must fetch it.
       const byKeyQuery = createLiveQueryCollection({
@@ -6596,20 +6577,8 @@ describe(`QueryCollection`, () => {
     })
 
     it(`does not short-circuit when the key clause is nested inside an or`, async () => {
-      const queryFn = makeQueryFn()
-      const collection = createOnDemandCollection(`short-circuit-or`, queryFn)
-
-      const listQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }) => eq(item.category, `A`)),
-      })
-      await listQuery.preload()
-      await vi.waitFor(() => {
-        expect(collection.has(`1`)).toBe(true)
-      })
-      expect(queryFn).toHaveBeenCalledTimes(1)
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-or`)
 
       // The key eq is buried in an `or` branch, so the result also depends on the
       // `category = 'B'` branch, which we have NOT loaded. The cache is not
@@ -6636,23 +6605,8 @@ describe(`QueryCollection`, () => {
     })
 
     it(`still issues a request when only some keys in an inArray lookup are cached`, async () => {
-      const queryFn = makeQueryFn()
-      const collection = createOnDemandCollection(
-        `short-circuit-partial`,
-        queryFn,
-      )
-
-      const listQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }) => eq(item.category, `A`)),
-      })
-      await listQuery.preload()
-      await vi.waitFor(() => {
-        expect(collection.has(`1`)).toBe(true)
-      })
-      expect(queryFn).toHaveBeenCalledTimes(1)
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-partial`)
 
       // `1` is cached but `3` is not, so the lookup can't be served locally.
       const byKeysQuery = createLiveQueryCollection({

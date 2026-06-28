@@ -34,10 +34,6 @@ import type { StandardSchemaV1 } from '@standard-schema/spec'
 // Re-export for external use
 export type { SyncOperation } from './manual-sync'
 
-// Lets getKeyFieldPath read a path back off its proxy; a symbol so it can't
-// collide with a real field name.
-const KEY_PATH_SYMBOL = Symbol(`keyFieldPath`)
-
 // Schema output type inference helper (matches electric.ts pattern)
 type InferSchemaOutput<T> = T extends StandardSchemaV1
   ? StandardSchemaV1.InferOutput<T> extends object
@@ -670,6 +666,10 @@ export function queryCollectionOptions(
       return cachedKeyFieldPath
     }
 
+    // Lets us read a path back off the proxy below; a symbol so it can't
+    // collide with a real field name.
+    const KEY_PATH_SYMBOL = Symbol(`keyFieldPath`)
+
     // Each property access returns a child proxy carrying its own path; getKey
     // returns the proxy at the key field, so we read the path back off it.
     const makeProxy = (path: Array<string>): any =>
@@ -713,7 +713,7 @@ export function queryCollectionOptions(
     where: IR.BasicExpression<boolean>,
   ): Array<string | number> | null => {
     const keyFieldPath = getKeyFieldPath()
-    if (!keyFieldPath) {
+    if (!keyFieldPath || where.type !== `func`) {
       return null
     }
 
@@ -745,7 +745,7 @@ export function queryCollectionOptions(
     }
 
     // In an `and(...)`, one key conjunct bounds the set; the rest only narrow it.
-    if (where.type === `func` && where.name === `and`) {
+    if (where.name === `and`) {
       for (const arg of where.args) {
         const values = valuesFromClause(arg as IR.BasicExpression<boolean>)
         if (values) {
