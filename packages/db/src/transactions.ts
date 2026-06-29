@@ -526,9 +526,15 @@ class Transaction<T extends object = Record<string, unknown>> {
    * (so the optimistic overlay is held — no flicker) until the thunk resolves,
    * then settles: drops the overlay and resolves `isSettled` / `isPersisted`.
    *
+   * Registering a settle step also *implies the acknowledgement*: when the handler
+   * returns without throwing, `commit()` flips `isAcknowledged` / `$acknowledged`
+   * before awaiting the thunk, so the adapter does not need a separate
+   * {@link Transaction.acknowledge} call (calling it explicitly is still a safe
+   * no-op). The settle milestone (`isSettled` / `isPersisted`) resolves when the
+   * thunk does.
+   *
    * If the thunk rejects, the transaction fails and rolls back, exactly as a
-   * throwing handler would. No-op timing change for `isAcknowledged`, which the
-   * adapter should resolve via {@link Transaction.acknowledge} before returning.
+   * throwing handler would. The acknowledgement, once flipped, is not retracted.
    * @returns This transaction for chaining
    */
   settleWith(fn: () => Promise<unknown>): Transaction<T> {
@@ -603,10 +609,13 @@ class Transaction<T extends object = Record<string, unknown>> {
         transaction: this as unknown as TransactionWithMutations<T>,
       })
 
-      // If the adapter handed the settle step to the framework, await it while
-      // still `persisting` so the optimistic overlay is held (no flicker) until
-      // the change has synced back.
+      // If the adapter handed the settle step to the framework, the handler has
+      // resolved without throwing — that *is* the acknowledgement. Flip
+      // `acknowledged` now (idempotent if the adapter already called it), then
+      // await the settle step while still `persisting` so the optimistic overlay
+      // is held (no flicker) until the change has synced back.
       if (this.settleFn) {
+        this.acknowledge()
         await this.settleFn()
       }
 

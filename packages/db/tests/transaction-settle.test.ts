@@ -78,6 +78,47 @@ describe(`Transaction.settleWith() + isSettled — the settle layer`, () => {
     subscription.unsubscribe()
   })
 
+  it(`flips acknowledged on handler return when settleWith is registered, without an explicit acknowledge()`, async () => {
+    const settleGate = createGate()
+
+    const collection = createCollection<Row, string>({
+      id: `settle-implies-ack`,
+      getKey: (item) => item.id,
+      sync: {
+        sync: ({ markReady }) => markReady(),
+      },
+      onInsert: async ({ transaction }) => {
+        // No explicit acknowledge() — registering settleWith and returning is
+        // the acknowledgement.
+        transaction.settleWith(() => settleGate.promise)
+      },
+    })
+
+    const subscription = collection.subscribeChanges(() => {}, {
+      includeInitialState: false,
+    })
+
+    const tx = collection.insert({ id: `r1`, value: `v` })
+    await tx.isAcknowledged.promise
+    await waitForChanges()
+
+    // Acknowledged purely from the handler returning, but still persisting and
+    // not settled — the overlay is held.
+    expect(tx.acknowledged).toBe(true)
+    expect(tx.state).toBe(`persisting`)
+    expect(tx.isSettled.isPending()).toBe(true)
+    const held = collection.state.get(`r1`)
+    expect(held?.$acknowledged).toBe(true)
+    expect(held?.$synced).toBe(false)
+
+    // Releasing the framework-owned settle step completes the transaction.
+    settleGate.release()
+    await tx.isSettled.promise
+    expect(tx.state).toBe(`completed`)
+
+    subscription.unsubscribe()
+  })
+
   it(`rejects isSettled and isPersisted (and rolls back) when the settle step fails`, async () => {
     const collection = createCollection<Row, string>({
       id: `settle-fail`,
