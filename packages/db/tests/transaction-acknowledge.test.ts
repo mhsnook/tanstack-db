@@ -242,6 +242,11 @@ describe(`Transaction.acknowledge() — the ack layer`, () => {
     await tx.isPersisted.promise
     await waitForChanges()
 
+    // Assert on `value` only: the emitted `value` sequence is coherent
+    // (false -> true). previousValue.$acknowledged is intentionally not checked
+    // here — when ack and settle coincide it reads `true` (a completed
+    // optimistic op counts as acknowledged); see the note in
+    // collectOptimisticChanges in collection/state.ts.
     const updates = changes.filter((c) => c.type === `update`)
     expect(updates.length).toBe(1)
     expect(updates[0]!.value.$acknowledged).toBe(true)

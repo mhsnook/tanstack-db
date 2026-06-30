@@ -1247,6 +1247,14 @@ export class CollectionStateManager<
       for (const key of changedKeys) {
         const previousVisibleValue = currentVisibleState.get(key)
         const newVisibleValue = this.get(key) // This returns the new derived state
+        // Quirk: $acknowledged on this "previous" snapshot is derived from the
+        // recomputed state, which counts a just-completed (settled) optimistic
+        // op as acknowledged (see getVirtualPropsSnapshotForState). So when ack
+        // and settle coincide — a collection that never calls acknowledge() —
+        // the emitted previousValue.$acknowledged can read `true` even though
+        // subscribers never received an acked-but-unsynced update. The emitted
+        // `value` sequence is always coherent (false -> true); consumers should
+        // track $acknowledged off `value`, not by diffing `previousValue`.
         const previousVirtualProps = this.getVirtualPropsSnapshotForState(key, {
           rowOrigins: previousRowOrigins,
           optimisticUpserts: previousOptimisticUpserts,
