@@ -242,16 +242,15 @@ describe(`Transaction.acknowledge() — the ack layer`, () => {
     await tx.isPersisted.promise
     await waitForChanges()
 
-    // Assert on `value` only: the emitted `value` sequence is coherent
-    // (false -> true). previousValue.$acknowledged is intentionally not checked
-    // here — when ack and settle coincide it reads `true` (a completed
-    // optimistic op counts as acknowledged); see the note in
-    // collectOptimisticChanges in collection/state.ts.
     const updates = changes.filter((c) => c.type === `update`)
     expect(updates.length).toBe(1)
     expect(updates[0]!.value.$acknowledged).toBe(true)
     expect(updates[0]!.value.$synced).toBe(true)
     expect(changes.length).toBe(2)
+    // previousValue is coherent with what was actually emitted before: the row
+    // was never acknowledged separately, so its previous $acknowledged is false.
+    expect(updates[0]!.previousValue?.$acknowledged).toBe(false)
+    expect(updates[0]!.previousValue?.$synced).toBe(false)
 
     subscription.unsubscribe()
   })
@@ -319,6 +318,10 @@ describe(`Transaction.acknowledge() — the ack layer`, () => {
     expect(settleUpdate.type).toBe(`update`)
     expect(settleUpdate.value.$acknowledged).toBe(true)
     expect(settleUpdate.value.$synced).toBe(true)
+    // The row was acknowledged before it settled, so previousValue reflects
+    // that: $acknowledged was already true, only $synced flips here.
+    expect(settleUpdate.previousValue?.$acknowledged).toBe(true)
+    expect(settleUpdate.previousValue?.$synced).toBe(false)
 
     subscription.unsubscribe()
   })
