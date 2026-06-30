@@ -257,9 +257,11 @@ export class CollectionStateManager<
       options?.optimisticUpserts ?? this.optimisticUpserts
     const optimisticDeletes =
       options?.optimisticDeletes ?? this.optimisticDeletes
-    // A completed (settled) optimistic op still shows an overlay (so it is not
-    // yet $synced), but whether it is $acknowledged depends on whether the
-    // server actually acknowledged it — not on the mere fact that it settled.
+    // `completedOptimisticKeys` are optimistic ops whose transaction has reached
+    // the `completed` state (its mutationFn returned) but whose overlay is still
+    // up while this cycle's sync is applied — so the row is not yet $synced.
+    // Whether it counts as $acknowledged is decided by the captured ack state
+    // below, not by the mere fact that the transaction completed.
     const isCompletedOptimistic =
       options?.completedOptimisticKeys?.has(key) === true
     const hasOptimisticChange =
