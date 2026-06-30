@@ -217,7 +217,7 @@ describe(`Transaction.acknowledge() — the ack layer`, () => {
         await settleGate.promise
         syncOps!.begin()
         for (const mutation of transaction.mutations) {
-          syncOps!.write({ type: `insert`, value: mutation.modified as Row })
+          syncOps!.write({ type: `insert`, value: mutation.modified })
         }
         syncOps!.commit()
       },
@@ -277,7 +277,7 @@ describe(`Transaction.acknowledge() — the ack layer`, () => {
         await settleGate.promise
         syncOps!.begin()
         for (const mutation of transaction.mutations) {
-          syncOps!.write({ type: `insert`, value: mutation.modified as Row })
+          syncOps!.write({ type: `insert`, value: mutation.modified })
         }
         syncOps!.commit()
       },
