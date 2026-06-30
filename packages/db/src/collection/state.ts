@@ -1250,23 +1250,25 @@ export class CollectionStateManager<
       this.pendingOptimisticDirectUpserts.clear()
       this.pendingOptimisticDirectDeletes.clear()
 
+      // The acknowledged state captured before the recompute (the recompute
+      // drops the now-completed transaction's ack), so each "previous" snapshot
+      // below reflects what was actually emitted before the settle — `false`
+      // when ack and settle coincide, `true` when the row was acknowledged
+      // first. Stable across the batch, so build the lookup once.
+      const preSyncAcknowledgedKeys = {
+        has: (k: TKey) => this.preSyncAcknowledged.get(k) === true,
+      }
+
       // Now check what actually changed in the final visible state
       for (const key of changedKeys) {
         const previousVisibleValue = currentVisibleState.get(key)
         const newVisibleValue = this.get(key) // This returns the new derived state
-        // Use the acknowledged state captured before the recompute (the
-        // recompute drops the now-completed transaction's ack), so this
-        // "previous" snapshot's $acknowledged matches what was actually emitted
-        // before the settle — `false` when ack and settle coincide, `true` when
-        // the row was acknowledged first.
         const previousVirtualProps = this.getVirtualPropsSnapshotForState(key, {
           rowOrigins: previousRowOrigins,
           optimisticUpserts: previousOptimisticUpserts,
           optimisticDeletes: previousOptimisticDeletes,
           completedOptimisticKeys: completedOptimisticOps,
-          acknowledgedKeys: {
-            has: (k) => this.preSyncAcknowledged.get(k) === true,
-          },
+          acknowledgedKeys: preSyncAcknowledgedKeys,
         })
         const nextVirtualProps = this.getVirtualPropsSnapshotForState(key)
         const virtualChanged =
