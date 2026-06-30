@@ -34,6 +34,7 @@ The result types are automatically inferred from your query structure, providing
 Live query results include computed, read-only virtual properties on every row:
 
 - `$synced`: `true` when the row is confirmed by sync; `false` when it is still optimistic.
+- `$acknowledged`: `true` once the server has accepted the write, even before it has synced back; always `true` when `$synced` is `true`. For collections without a separate acknowledgement signal this coincides with `$synced`. Useful for dropping a pending indicator as soon as the server has the write, without waiting for the sync echo. See [Reacting to acknowledgement](./mutations.md#reacting-to-acknowledgement-vs-sync) in the mutations guide.
 - `$origin`: `"local"` if the last confirmed change came from this client, otherwise `"remote"`.
 - `$key`: the row key for the result.
 - `$collectionId`: the source collection ID.

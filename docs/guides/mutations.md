@@ -992,6 +992,35 @@ tx.isPersisted.promise.then(() => {
 console.log(tx.state) // 'pending', 'persisting', 'completed', or 'failed'
 ```
 
+### Reacting to acknowledgement vs. sync
+
+When a collection syncs against a realtime backend, an optimistic write has **two** confirmations:
+
+- **acknowledged** — the server accepted the write (the request resolved; the write id is known).
+- **settled** — the change echoed back through sync, so the optimistic overlay can be dropped with no flicker.
+
+`isPersisted` (and the `$synced` virtual property) resolve at **settle**. For many UIs the **acknowledgement** is the moment that matters — once the server has the write you can drop a spinner or fire a success toast, without waiting for the sync round-trip. That earlier signal is exposed as `transaction.isAcknowledged` and the [`$acknowledged`](./live-queries.md#virtual-properties) virtual property:
+
+```typescript
+const tx = todoCollection.insert(draft)
+
+await tx.isAcknowledged.promise  // resolves at acknowledgement — never later than isPersisted
+toast.success("Saved")           // server has the write; sync may still be catching up
+
+await tx.isPersisted.promise     // resolves at settle, exactly as before
+```
+
+`isAcknowledged` is always safe to await: if the collection has no separate acknowledgement signal it resolves together with `isPersisted`, and it rejects if the transaction fails before being acknowledged. Reactively, `$acknowledged` lets you show an intermediate "saved, syncing…" state:
+
+```tsx
+const label =
+  !row.$acknowledged ? "Saving…"   // in flight
+  : !row.$synced     ? "Saved"     // server has it; sync catching up
+  :                    "Saved"     // fully settled
+```
+
+`isPersisted` / `$synced` are unchanged — this is purely an additional, earlier signal you can opt into. Whether a given collection surfaces a distinct acknowledgement depends on its adapter; collections without one simply have `$acknowledged` coincide with `$synced`.
+
 ## Paced Mutations
 
 Paced mutations provide fine-grained control over **when and how** mutations are persisted to your backend. Instead of persisting every mutation immediately, you can use timing strategies to batch, delay, or queue mutations based on your application's needs.
