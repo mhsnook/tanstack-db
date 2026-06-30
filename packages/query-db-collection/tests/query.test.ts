@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { QueryClient, hashKey } from '@tanstack/query-core'
 import {
   BTreeIndex,
+  and,
   createCollection,
   createLiveQueryCollection,
   eq,
@@ -6513,6 +6514,188 @@ describe(`QueryCollection`, () => {
       taskQuery.cleanup()
       projectQuery.cleanup()
       customQueryClient.clear()
+    })
+  })
+
+  describe(`Load-by-key cache short-circuit (on-demand)`, () => {
+    const seedItems: Array<CategorisedItem> = [
+      { id: `1`, name: `Item 1`, category: `A` },
+      { id: `2`, name: `Item 2`, category: `A` },
+      { id: `3`, name: `Item 3`, category: `B` },
+    ]
+
+    const isCategoryAWhere = (where: any) =>
+      where?.type === `func` &&
+      where.name === `eq` &&
+      where.args[0]?.path?.[0] === `category` &&
+      where.args[1]?.value === `A`
+
+    const isIdWhere = (where: any, name: `eq` | `in`) =>
+      where?.type === `func` &&
+      where.name === name &&
+      where.args[0]?.path?.[0] === `id`
+
+    // queryFn that resolves data based on the predicate passed via loadSubsetOptions.
+    const makeQueryFn = () =>
+      vi.fn().mockImplementation((context: QueryFunctionContext) => {
+        const where = (context.meta?.loadSubsetOptions as any)?.where
+        if (isCategoryAWhere(where)) {
+          return Promise.resolve(
+            seedItems.filter((item) => item.category === `A`),
+          )
+        }
+        if (isIdWhere(where, `eq`)) {
+          const id = where.args[1].value
+          return Promise.resolve(seedItems.filter((item) => item.id === id))
+        }
+        if (isIdWhere(where, `in`)) {
+          const ids: Array<string> = where.args[1].value
+          return Promise.resolve(seedItems.filter((item) => ids.includes(item.id)))
+        }
+        return Promise.resolve([])
+      })
+
+    const createOnDemandCollection = (id: string, queryFn: any) =>
+      createCollection(
+        queryCollectionOptions({
+          id,
+          queryClient,
+          queryKey: (ctx: any) => (ctx.where ? [id, ctx.where] : [id]),
+          queryFn,
+          getKey,
+          startSync: true,
+          syncMode: `on-demand`,
+        } as QueryCollectionConfig<CategorisedItem>),
+      )
+
+    // Every test starts from the same state: a category A list query loaded
+    // (items 1 and 2 in the collection) via a single queryFn call.
+    const setupWithCategoryAListLoaded = async (id: string) => {
+      const queryFn = makeQueryFn()
+      const collection = createOnDemandCollection(id, queryFn)
+      const listQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => eq(item.category, `A`)),
+      })
+      await listQuery.preload()
+      await vi.waitFor(() => {
+        expect(collection.has(`1`)).toBe(true)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      return { collection, queryFn, listQuery }
+    }
+
+    it(`does not issue a new request for an eq key lookup when the key is already cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-eq`)
+
+      // A by-key live query for an already-cached key must reuse the cached row
+      // and NOT trigger a new request, even though its query key differs.
+      const byKeyQuery = createLiveQueryCollection({
+        query: (q) =>
+          q.from({ item: collection }).where(({ item }) => eq(item.id, `1`)),
+      })
+      await byKeyQuery.preload()
+
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(byKeyQuery.size).toBe(1)
+      expect(byKeyQuery.get(`1`)?.name).toBe(`Item 1`)
+
+      listQuery.cleanup()
+      byKeyQuery.cleanup()
+    })
+
+    it(`does not issue a new request for an inArray key lookup when all keys are cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-in`)
+      expect(collection.has(`2`)).toBe(true)
+
+      const byKeysQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => inArray(item.id, [`1`, `2`])),
+      })
+      await byKeysQuery.preload()
+
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(byKeysQuery.size).toBe(2)
+
+      listQuery.cleanup()
+      byKeysQuery.cleanup()
+    })
+
+    it(`still issues a request for a key lookup when the key is not cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-miss`)
+
+      // Item 3 (category B) was never loaded, so a by-key lookup must fetch it.
+      const byKeyQuery = createLiveQueryCollection({
+        query: (q) =>
+          q.from({ item: collection }).where(({ item }) => eq(item.id, `3`)),
+      })
+      await byKeyQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(byKeyQuery.size).toBe(1)
+      })
+      expect(byKeyQuery.get(`3`)?.name).toBe(`Item 3`)
+
+      listQuery.cleanup()
+      byKeyQuery.cleanup()
+    })
+
+    it(`does not short-circuit when the key clause is nested inside an or`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-or`)
+
+      // The key eq is buried in an `or` branch, so the result also depends on the
+      // `category = 'B'` branch, which we have NOT loaded. The cache is not
+      // authoritative here, so a request must still be issued.
+      const orQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) =>
+              or(
+                eq(item.category, `B`),
+                and(eq(item.id, `1`), eq(item.category, `A`)),
+              ),
+            ),
+      })
+      await orQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+      })
+
+      listQuery.cleanup()
+      orQuery.cleanup()
+    })
+
+    it(`still issues a request when only some keys in an inArray lookup are cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-partial`)
+
+      // `1` is cached but `3` is not, so the lookup can't be served locally.
+      const byKeysQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => inArray(item.id, [`1`, `3`])),
+      })
+      await byKeysQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(byKeysQuery.size).toBe(2)
+      })
+
+      listQuery.cleanup()
+      byKeysQuery.cleanup()
     })
   })
 })

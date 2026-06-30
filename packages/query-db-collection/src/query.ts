@@ -13,6 +13,7 @@ import type {
   ChangeMessage,
   CollectionConfig,
   DeleteMutationFnParams,
+  IR,
   InsertMutationFnParams,
   LoadSubsetOptions,
   SyncConfig,
@@ -647,6 +648,116 @@ export function queryCollectionOptions(
     throw new GetKeyRequiredError()
   }
 
+  // ===========================================================================
+  // NOTE: everything down to extractKeyLookupValues exists ONLY because a
+  // collection has no `collection.key` to read — the key is an opaque
+  // `getKey(item)` function. So we reverse-engineer the key's field path by
+  // running getKey against a proxy. If collections ever expose the key path,
+  // delete getKeyFieldPath and read it directly.
+  // ===========================================================================
+
+  // getKey's field path (e.g. ['id']), derived once and cached. Tri-state:
+  // undefined = not computed; null = composite/derived key we can't reduce to a
+  // single field (optimization off); array = the key path.
+  let cachedKeyFieldPath: Array<string> | null | undefined = undefined
+
+  const getKeyFieldPath = (): Array<string> | null => {
+    if (cachedKeyFieldPath !== undefined) {
+      return cachedKeyFieldPath
+    }
+
+    // Lets us read a path back off the proxy below; a symbol so it can't
+    // collide with a real field name.
+    const KEY_PATH_SYMBOL = Symbol(`keyFieldPath`)
+
+    // Each property access returns a child proxy carrying its own path; getKey
+    // returns the proxy at the key field, so we read the path back off it.
+    const makeProxy = (path: Array<string>): any =>
+      new Proxy(
+        {},
+        {
+          get: (_target, prop) =>
+            prop === KEY_PATH_SYMBOL
+              ? path
+              : typeof prop === `string`
+                ? makeProxy([...path, prop])
+                : undefined,
+        },
+      )
+
+    let keyFieldPath: Array<string> | null = null
+    try {
+      const returned = getKey(makeProxy([]) as any) as
+        | { [KEY_PATH_SYMBOL]?: Array<string> }
+        | undefined
+      const path = returned?.[KEY_PATH_SYMBOL]
+      // Empty path = getKey returned the row itself; a non-proxy return (or a
+      // throw) = a derived/composite key. Neither is a single-field key.
+      if (Array.isArray(path) && path.length > 0) {
+        keyFieldPath = path
+      }
+    } catch {
+      // getKey combines/transforms fields — not a plain key lookup.
+    }
+
+    cachedKeyFieldPath = keyFieldPath
+    return keyFieldPath
+  }
+
+  // ─── here's where the functionality sort of starts ───────────────────────
+  // Given the key field path, pull the key value(s) out of a load-by-key
+  // `where`: a bare `eq`/`in` on the key, or an `and(...)` containing one.
+  // Returns null when it isn't a key lookup. Consumed by the opts.where
+  // short-circuit in createQueryFromOpts.
+  const extractKeyLookupValues = (
+    where: IR.BasicExpression<boolean>,
+  ): Array<string | number> | null => {
+    const keyFieldPath = getKeyFieldPath()
+    if (!keyFieldPath || where.type !== `func`) {
+      return null
+    }
+
+    // Does this ref point at the key field?
+    const refMatchesKey = (expr: IR.BasicExpression | undefined): boolean =>
+      expr?.type === `ref` &&
+      expr.path.length === keyFieldPath.length &&
+      expr.path.every((segment, i) => segment === keyFieldPath[i])
+
+    // Key value(s) from one clause. Ref is always arg 0 (IR builder convention).
+    const valuesFromClause = (
+      clause: IR.BasicExpression<boolean>,
+    ): Array<string | number> | null => {
+      if (clause.type !== `func` || !refMatchesKey(clause.args[0])) {
+        return null
+      }
+      const value = clause.args[1]
+      if (clause.name === `eq` && value?.type === `val`) {
+        return [value.value as string | number]
+      }
+      if (
+        clause.name === `in` &&
+        value?.type === `val` &&
+        Array.isArray(value.value)
+      ) {
+        return value.value as Array<string | number>
+      }
+      return null
+    }
+
+    // In an `and(...)`, one key conjunct bounds the set; the rest only narrow it.
+    if (where.name === `and`) {
+      for (const arg of where.args) {
+        const values = valuesFromClause(arg as IR.BasicExpression<boolean>)
+        if (values) {
+          return values
+        }
+      }
+      return null
+    }
+
+    return valuesFromClause(where)
+  }
+
   /** State object to hold error tracking and observer reference */
   const state: QueryCollectionState = {
     lastError: undefined as any,
@@ -1087,6 +1198,20 @@ export function queryCollectionOptions(
           const resumed = createQueryFromOpts(opts, queryFunction)
           return resumed === true ? undefined : resumed
         })
+      }
+
+      // Load-by-key short-circuit: a lookup by key whose keys we already hold is
+      // authoritative (keys are unique), so skip the request — even when the
+      // derived query key doesn't match an existing query.
+      if (opts.where) {
+        const keyValues = extractKeyLookupValues(opts.where)
+        if (
+          keyValues &&
+          keyValues.length > 0 &&
+          keyValues.every((keyValue) => collection.has(keyValue))
+        ) {
+          return true
+        }
       }
 
       // Generate key using common function
