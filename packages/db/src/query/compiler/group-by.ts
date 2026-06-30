@@ -64,8 +64,9 @@ function getRowVirtualMetadata(row: NamespacedRow): RowVirtualMetadata {
     if (asRecord.$synced === false) {
       allSynced = false
     }
-    // $acknowledged falls back to $synced for rows from collections without a
-    // separate ack signal.
+    // Some rows may not carry $acknowledged at all (e.g. from a source that
+    // predates this property). Fall back to $synced, which $acknowledged
+    // always tracks when present (a synced row is always acknowledged).
     const rowAcknowledged =
       `$acknowledged` in asRecord
         ? asRecord.$acknowledged !== false
