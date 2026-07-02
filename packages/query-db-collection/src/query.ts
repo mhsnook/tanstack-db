@@ -1,5 +1,5 @@
 import { QueryObserver, hashKey } from '@tanstack/query-core'
-import { deepEquals } from '@tanstack/db'
+import { deepEquals, isWhereSubset, walkExpression } from '@tanstack/db'
 import {
   GetKeyRequiredError,
   QueryClientRequiredError,
@@ -49,6 +49,40 @@ type InferSchemaInput<T> = T extends StandardSchemaV1
   : Record<string, unknown>
 
 type TQueryKeyBuilder<TQueryKey> = (opts: LoadSubsetOptions) => TQueryKey
+
+/**
+ * Opt-in configuration for predicate-inclusion deduplication ("level 3"):
+ * serving a narrower query locally from an already-loaded broader query in
+ * on-demand mode (e.g. `language='hin' AND difficulty='hard'` from a live
+ * `language='hin'` query), instead of issuing a new request.
+ *
+ * Serving a subset locally is only correct if the server applies no hidden,
+ * non-monotonic filtering on the columns the narrower query is stricter on
+ * (the *residual* — the part of the predicate applied locally rather than on
+ * the server). A server that, say, hides archived rows unless asked would make
+ * `language='hin' AND archived=true` look like a subset of `language='hin'`
+ * while its true result is disjoint from the loaded rows. This config declares
+ * which columns are safe:
+ *
+ * - absent or `false` (default) — level 3 off; no behavior change.
+ * - `true` — every column is a faithful, monotonic filter; trust all narrowing.
+ * - `Array<string>` — allowlist of inclusion-safe columns (dotted paths for
+ *   nested fields). A residual touching any other column falls back to a fetch.
+ * - `{ except: [...] }` — trust every column except these. Still an explicit
+ *   opt-in, but a forgotten unsafe column silently serves incomplete data —
+ *   prefer the allowlist unless the backend is faithful-except-for-a-few.
+ * - `(residual) => boolean` — escape hatch for safety rules that aren't a flat
+ *   column set; receives the residual predicate as `{ where }`.
+ *
+ * Misconfiguration risk is asymmetric: omitting a safe column costs a redundant
+ * fetch; declaring an unsafe column safe silently serves wrong (incomplete)
+ * results.
+ */
+export type DedupeQueriesOn =
+  | boolean
+  | Array<string>
+  | { except: Array<string> }
+  | ((residual: LoadSubsetOptions) => boolean)
 
 /**
  * Configuration options for creating a Query Collection
@@ -150,6 +184,22 @@ export interface QueryCollectionConfig<
    * }
    */
   meta?: Record<string, unknown>
+
+  /**
+   * Opt in to serving narrower on-demand queries locally from broader
+   * already-loaded live queries (predicate inclusion). Off when absent.
+   * See {@link DedupeQueriesOn} for the accepted forms and the correctness
+   * contract each implies.
+   *
+   * @example
+   * // `language` and `difficulty` are plain, subtractive filters on the server
+   * queryCollectionOptions({
+   *   // ...
+   *   syncMode: 'on-demand',
+   *   dedupeQueriesOn: ['language', 'difficulty'],
+   * })
+   */
+  dedupeQueriesOn?: DedupeQueriesOn
 }
 
 /**
@@ -348,6 +398,102 @@ class QueryCollectionUtilsImpl {
       (observer) => observer.getCurrentResult().fetchStatus,
     )
   }
+}
+
+// ===========================================================================
+// Predicate-inclusion (level 3) helpers.
+//
+// A request N can be served from an already-loaded live query L when
+// `isWhereSubset(N.where, L.where)` holds AND the *residual* — the narrowing
+// N applies on top of L, which runs locally against L's rows instead of on
+// the server — touches only columns the developer declared inclusion-safe
+// via `dedupeQueriesOn`. The subset check alone is not sufficient: the server
+// is opaque and may apply hidden non-monotonic filters (soft-delete, auth,
+// default scopes), so narrowing on such a column can select rows the broader
+// response never contained.
+// ===========================================================================
+
+/** Split a where clause into its top-level conjuncts, flattening nested `and`s. */
+const flattenAndConjuncts = (
+  where: IR.BasicExpression<boolean>,
+): Array<IR.BasicExpression<boolean>> =>
+  where.type === `func` && where.name === `and`
+    ? where.args.flatMap((arg) =>
+        flattenAndConjuncts(arg as IR.BasicExpression<boolean>),
+      )
+    : [where]
+
+/**
+ * The residual of serving `requestWhere` from a load covering `loadedWhere`:
+ * the conjuncts of the request that the loaded predicate does not already
+ * guarantee (a conjunct C is guaranteed when loaded ⇒ C, i.e.
+ * `isWhereSubset(loadedWhere, C)`). These are exactly the axes on which the
+ * request is stricter than the loaded query — the part evaluated locally.
+ *
+ * Note this is deliberately not `minusWherePredicates(request, loaded)`: once
+ * `isWhereSubset(request, loaded)` holds, that set difference is always the
+ * empty set (request ∖ loaded = ∅), which says nothing about which columns
+ * the local narrowing trusts.
+ */
+const computeInclusionResidual = (
+  requestWhere: IR.BasicExpression<boolean>,
+  loadedWhere: IR.BasicExpression<boolean> | undefined,
+): Array<IR.BasicExpression<boolean>> =>
+  flattenAndConjuncts(requestWhere).filter(
+    (conjunct) => !isWhereSubset(loadedWhere, conjunct),
+  )
+
+/** Dotted paths of all columns referenced by an expression. */
+const collectReferencedColumns = (expr: IR.BasicExpression): Array<string> => {
+  const columns: Array<string> = []
+  walkExpression(expr, (node) => {
+    if (node.type === `ref`) {
+      columns.push(node.path.join(`.`))
+    }
+  })
+  return columns
+}
+
+/**
+ * The §3 correctness gate: is every residual conjunct safe to apply as a
+ * local filter, per the collection's `dedupeQueriesOn` declaration?
+ * Errs toward `false` (fetch): a conjunct referencing no recognizable column
+ * cannot be attributed to a safe axis, so it fails the column-based forms.
+ */
+const isResidualSafe = (
+  residual: Array<IR.BasicExpression<boolean>>,
+  dedupeQueriesOn: Exclude<DedupeQueriesOn, false>,
+): boolean => {
+  if (residual.length === 0) {
+    // The loaded query already guarantees every conjunct — nothing is
+    // filtered locally, so no column is being trusted.
+    return true
+  }
+  if (dedupeQueriesOn === true) {
+    return true
+  }
+  if (typeof dedupeQueriesOn === `function`) {
+    const where =
+      residual.length === 1
+        ? residual[0]!
+        : ({
+            type: `func`,
+            name: `and`,
+            args: residual,
+          } as IR.BasicExpression<boolean>)
+    return dedupeQueriesOn({ where })
+  }
+  const referenced = residual.map(collectReferencedColumns)
+  if (referenced.some((columns) => columns.length === 0)) {
+    return false
+  }
+  return Array.isArray(dedupeQueriesOn)
+    ? referenced.every((columns) =>
+        columns.every((column) => dedupeQueriesOn.includes(column)),
+      )
+    : referenced.every((columns) =>
+        columns.every((column) => !dedupeQueriesOn.except.includes(column)),
+      )
 }
 
 /**
@@ -593,6 +739,7 @@ export function queryCollectionOptions(
     onUpdate,
     onDelete,
     meta,
+    dedupeQueriesOn,
     ...baseCollectionConfig
   } = config
 
@@ -687,7 +834,7 @@ export function queryCollectionOptions(
 
     let keyFieldPath: Array<string> | null = null
     try {
-      const returned = getKey(makeProxy([]) as any) as
+      const returned = getKey(makeProxy([])) as
         | { [KEY_PATH_SYMBOL]?: Array<string> }
         | undefined
       const path = returned?.[KEY_PATH_SYMBOL]
@@ -797,6 +944,24 @@ export function queryCollectionOptions(
   // 2. Uses existing machinery (queryToRows map) to find rows that query loaded
   // 3. Decrements refcount and GCs rows where count reaches 0
   const queryRefCounts = new Map<string, number>()
+
+  // Predicate-inclusion (level 3) state — only consulted when `dedupeQueriesOn`
+  // is set.
+  // ==========================================================================
+  // hashedQueryKey → the LoadSubsetOptions its live observer was created with.
+  // Entries live exactly as long as the observer (added on observer creation,
+  // removed wherever the observer is torn down). Tying coverage to live
+  // observers — rather than a monotonic log — is what keeps it honest: when a
+  // covering query unloads and its rows are GC'd, it leaves the registry, so
+  // later subset requests miss and fetch instead of serving vanished rows.
+  const loadedPredicates = new Map<string, LoadSubsetOptions>()
+
+  // hashed subset-query key → stack of covering-query hashes it pinned, one
+  // entry per loadSubset call served via inclusion. A served subset holds a
+  // refcount on its covering query (not on itself: it has no observer), so the
+  // covering rows outlive e.g. a route loader that tears down first. Each
+  // unloadSubset pops one pin and releases that refcount.
+  const servedByCoveringQuery = new Map<string, Array<string>>()
 
   // Helper function to add a row to the internal state
   const addRow = (rowKey: string | number, hashedQueryKey: string) => {
@@ -1172,6 +1337,46 @@ export function queryCollectionOptions(
       }
     }
 
+    /**
+     * Predicate-inclusion (level 3) match: find a live query whose loaded
+     * predicate covers `opts` and whose residual passes the inclusion-safe
+     * gate. Every `continue` errs toward fetching — worst case a redundant
+     * request, never wrong data.
+     */
+    const findCoveringQueryHash = (
+      opts: LoadSubsetOptions,
+    ): string | undefined => {
+      if (!dedupeQueriesOn || !opts.where) {
+        return undefined
+      }
+      for (const [coveringHash, loaded] of loadedPredicates) {
+        // MVP: only an unlimited, un-windowed load is a complete partition a
+        // narrower predicate can safely be answered from.
+        if (
+          loaded.limit !== undefined ||
+          loaded.offset !== undefined ||
+          loaded.cursor !== undefined
+        ) {
+          continue
+        }
+        // Only serve from data that has actually landed (§5.4: still-loading
+        // covering queries are skipped; the subset fetches its own data).
+        const observer = state.observers.get(coveringHash)
+        if (!observer?.getCurrentResult().isSuccess) {
+          continue
+        }
+        if (!isWhereSubset(opts.where, loaded.where)) {
+          continue
+        }
+        const residual = computeInclusionResidual(opts.where, loaded.where)
+        if (!isResidualSafe(residual, dedupeQueriesOn)) {
+          continue
+        }
+        return coveringHash
+      }
+      return undefined
+    }
+
     const startupRetentionEntries = metadata?.collection.list(
       QUERY_COLLECTION_GC_PREFIX,
     )
@@ -1217,6 +1422,38 @@ export function queryCollectionOptions(
       // Generate key using common function
       const key = generateQueryKeyFromOptions(opts)
       const hashedQueryKey = hashKey(key)
+
+      // Predicate-inclusion short-circuit (level 3, opt-in via
+      // `dedupeQueriesOn`): serve a strictly-narrower request from a live,
+      // already-loaded broader query. An exact-key match is excluded — reusing
+      // the request's own observer (below) is cheaper and handles the
+      // loading/error states. A request with a persisted retention placeholder
+      // is also excluded: its rows are pending revalidation and must be
+      // reconciled by a real fetch, not covered over.
+      if (
+        !state.observers.has(hashedQueryKey) &&
+        metadata?.collection.get(
+          `${QUERY_COLLECTION_GC_PREFIX}${hashedQueryKey}`,
+        ) === undefined
+      ) {
+        const coveringHash = findCoveringQueryHash(opts)
+        if (coveringHash !== undefined) {
+          // Pin the covering query: the subset now depends on its rows, so it
+          // must hold them live until the subset itself unloads (§5.3).
+          queryRefCounts.set(
+            coveringHash,
+            (queryRefCounts.get(coveringHash) || 0) + 1,
+          )
+          const pins = servedByCoveringQuery.get(hashedQueryKey)
+          if (pins) {
+            pins.push(coveringHash)
+          } else {
+            servedByCoveringQuery.set(hashedQueryKey, [coveringHash])
+          }
+          return true
+        }
+      }
+
       const extendedMeta = { ...meta, loadSubsetOptions: opts }
       const retainedEntry = metadata?.collection.get(
         `${QUERY_COLLECTION_GC_PREFIX}${hashedQueryKey}`,
@@ -1314,6 +1551,7 @@ export function queryCollectionOptions(
 
       hashToQueryKey.set(hashedQueryKey, key)
       state.observers.set(hashedQueryKey, localObserver)
+      loadedPredicates.set(hashedQueryKey, opts)
       if (effectivePersistedGcTime !== undefined) {
         effectivePersistedGcTimes.set(hashedQueryKey, effectivePersistedGcTime)
       } else {
@@ -1672,6 +1910,20 @@ export function queryCollectionOptions(
       hashToQueryKey.delete(hashedQueryKey)
       queryRefCounts.delete(hashedQueryKey)
       effectivePersistedGcTimes.delete(hashedQueryKey)
+
+      // Level-3 bookkeeping: the observer is gone, so its predicate no longer
+      // covers anything, and any pins on it (or held by it as a served subset)
+      // are void. The refcounts a pin represented die with the query.
+      loadedPredicates.delete(hashedQueryKey)
+      servedByCoveringQuery.delete(hashedQueryKey)
+      servedByCoveringQuery.forEach((pins, servedHash) => {
+        const remaining = pins.filter((pin) => pin !== hashedQueryKey)
+        if (remaining.length === 0) {
+          servedByCoveringQuery.delete(servedHash)
+        } else if (remaining.length !== pins.length) {
+          servedByCoveringQuery.set(servedHash, remaining)
+        }
+      })
     }
 
     /**
@@ -1741,6 +1993,9 @@ export function queryCollectionOptions(
         state.observers.delete(hashedQueryKey)
         hashToQueryKey.delete(hashedQueryKey)
         queryRefCounts.set(hashedQueryKey, 0)
+        // Retained rows are placeholders pending revalidation — they must not
+        // serve predicate-inclusion (level 3) matches.
+        loadedPredicates.delete(hashedQueryKey)
         return
       }
 
@@ -1828,7 +2083,24 @@ export function queryCollectionOptions(
       const key = generateQueryKeyFromOptions(options)
       const hashedQueryKey = hashKey(key)
 
+      // A subset served via predicate inclusion (level 3) has no observer of
+      // its own — it holds a pin (refcount) on its covering query instead.
+      // Release the pin rather than decrementing the subset's own key.
+      const pins = servedByCoveringQuery.get(hashedQueryKey)
+      if (pins && pins.length > 0) {
+        const coveringHash = pins.pop()!
+        if (pins.length === 0) {
+          servedByCoveringQuery.delete(hashedQueryKey)
+        }
+        decrementQueryRefCount(coveringHash)
+        return
+      }
+
       // 3. Decrement refcount
+      decrementQueryRefCount(hashedQueryKey)
+    }
+
+    const decrementQueryRefCount = (hashedQueryKey: string) => {
       const currentCount = queryRefCounts.get(hashedQueryKey) || 0
       const newCount = currentCount - 1
 
