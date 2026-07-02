@@ -463,3 +463,50 @@ project with its own design pass.
   subset mounted; tear down subset → rows GC.
 - conservative fallbacks: unsimplifiable residual ⇒ fetch; limited `L` ⇒ skipped.
 - `or`-nested key/partition ⇒ not served (carried over from PR #1).
+
+---
+
+## References — code pointers
+
+Links pin to commit [`883bbc3`](https://github.com/mhsnook/tanstack-db/tree/883bbc31aec5ade6cad82d75cd9f18381f832017)
+so line numbers stay stable. Everything under `packages/query-db-collection` is
+our code (incl. the PR #1 work this builds on); everything under `packages/db`
+and `packages/electric-db-collection` is the surrounding TanStack DB core /
+sibling adapter.
+
+### Levels 1 & 2 — shipped today (§1, §2)
+
+- [`createQueryFromOpts`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L1192) — the registered on-demand `loadSubset` handler; holds level-1 exact-key observer reuse and is where the level-3 hook lands.
+- [level-2 load-by-key short-circuit](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L1203) — returns `true` (no fetch) when every requested key is already in the collection.
+- [`getKeyFieldPath`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L664) / [`extractKeyLookupValues`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L712) — derive the key field (via proxy) and pull key values from a where-clause; §5 generalizes this ref-matching to arbitrary safe columns.
+
+### Predicate algebra — reused as-is (§3, §4.7, §5.2)
+
+- [`isWhereSubset`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/predicate-utils.ts#L21) — is `N ⊆ L`? The necessary-but-not-sufficient condition in §3's rule.
+- [`minusWherePredicates`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/predicate-utils.ts#L340) — computes the residual (`N` minus `L`) whose columns the correctness gate checks.
+- [`isPredicateSubset`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/predicate-utils.ts#L856) — where + orderBy + limit subset check; its limited-superset branch (requires where-equality) is exactly why §2 defers pagination.
+- [`unionWherePredicates`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/predicate-utils.ts#L297) — the sibling/cousin union deferred in §2.
+
+### Config surface — proposed (§4)
+
+- [`QueryCollectionConfig`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L61) — the options interface where `dedupeQueriesOn` would be added (not yet implemented).
+
+### Ownership / lifetime — to extend (§5.3)
+
+- [`queryRefCounts`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L799) — the per-query refcount map §5.3 pins the covering query in.
+- [`unloadSubset`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L1826) — the decrement path; extended to decrement the covering `L` via a `servedBy` map.
+- [`cleanupQueryIfIdle`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L1681) / [`cleanupQueryInternal`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L1615) — GC an idle query and its owned rows; the live-predicate registry (§5.2) is removed here.
+- [`loadSubset` / `unloadSubset` registration](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/query-db-collection/src/query.ts#L1848) — where the on-demand handlers are wired onto the sync result.
+
+### Why not `DeduplicatedLoadSubset` (§6)
+
+- [`DeduplicatedLoadSubset`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/subset-dedupe.ts#L34) — the shared coverage container we deliberately do **not** adopt.
+- [`unlimitedWhere`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/subset-dedupe.ts#L46) + [`reset`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/subset-dedupe.ts#L194) — the monotonic coverage state (only grows; all-or-nothing reset) that would go stale under query-db's GC-on-unload.
+- [`onDeduplicate`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/subset-dedupe.ts#L41) — the per-dedup hook a future shared integration would wire to row tracking.
+- [electric's usage](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/electric-db-collection/src/electric.ts#L539) — `new DeduplicatedLoadSubset({ loadSubset })`, the pattern §6 diverges from.
+
+### Batching — forward-looking (§7)
+
+- [`loadMoreIfNeeded`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/live/collection-subscriber.ts#L322) → [`loadNextItems`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/live/collection-subscriber.ts#L384) — the demand-driven lazy-load loop; the `n` decision point a `BatchPolicy` would replace.
+- [`dataNeeded`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/query/compiler/order-by.ts#L315) — computes `limit - size`, i.e. today's exact-deficit (no overscan / chunking).
+- [`requestLimitedSnapshot`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/collection/subscription.ts#L430) / [`requestSnapshot`](https://github.com/mhsnook/tanstack-db/blob/883bbc31aec5ade6cad82d75cd9f18381f832017/packages/db/src/collection/subscription.ts#L342) — the sync-layer snapshot calls that the requested size flows into.
