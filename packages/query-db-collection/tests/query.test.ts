@@ -3,6 +3,7 @@ import { QueryClient, hashKey } from '@tanstack/query-core'
 import {
   BTreeIndex,
   and,
+  compileSingleRowExpression,
   createCollection,
   createLiveQueryCollection,
   eq,
@@ -11,6 +12,7 @@ import {
   inArray,
   lte,
   or,
+  walkExpression,
 } from '@tanstack/db'
 import { stripVirtualProps } from '../../db/tests/utils'
 import { persistedCollectionOptions } from '../../db-sqlite-persistence-core/src'
@@ -6647,44 +6649,20 @@ describe(`QueryCollection`, () => {
       { id: 25, language: `hin`, difficulty: `hard`, archived: false },
     ]
 
-    // Evaluate a where expression the way a faithful backend would.
-    const evalWhere = (where: any, item: any): boolean => {
-      if (!where) return true
-      if (where.type === `val`) return Boolean(where.value)
-      if (where.name === `and`) {
-        return where.args.every((arg: any) => evalWhere(arg, item))
-      }
-      if (where.name === `or`) {
-        return where.args.some((arg: any) => evalWhere(arg, item))
-      }
-      const field = where.args[0]?.path?.join(`.`)
-      const value = where.args[1]?.value
-      const actual = item[field]
-      switch (where.name) {
-        case `eq`:
-          return actual === value
-        case `gt`:
-          return actual > value
-        case `gte`:
-          return actual >= value
-        case `lt`:
-          return actual < value
-        case `lte`:
-          return actual <= value
-        case `in`:
-          return Array.isArray(value) && value.includes(actual)
-        default:
-          return false
-      }
-    }
+    // Evaluate a where expression the way a faithful backend would — using
+    // the canonical evaluator, so the mock server's comparison semantics
+    // can't drift from the real ones.
+    const evalWhere = (where: any, item: any): boolean =>
+      !where || Boolean(compileSingleRowExpression(where)(item))
 
     const mentionsColumn = (expr: any, column: string): boolean => {
-      if (!expr || typeof expr !== `object`) return false
-      if (expr.type === `ref`) return expr.path?.join(`.`) === column
-      if (expr.type === `func`) {
-        return expr.args.some((arg: any) => mentionsColumn(arg, column))
-      }
-      return false
+      let found = false
+      walkExpression(expr, (node: any) => {
+        if (node.type === `ref` && node.path?.join(`.`) === column) {
+          found = true
+        }
+      })
+      return found
     }
 
     // A server with a hidden, non-monotonic filter (design doc §3): archived
@@ -6746,6 +6724,33 @@ describe(`QueryCollection`, () => {
       return partition
     }
 
+    // The canonical narrowing queries the tests probe with: a subset on a
+    // typically-safe column (difficulty) and one on the server's hidden
+    // filter column (archived).
+    const makeHardQuery = (
+      collection: ReturnType<typeof createContentCollection>,
+    ) =>
+      createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
+            ),
+      })
+
+    const makeArchivedQuery = (
+      collection: ReturnType<typeof createContentCollection>,
+    ) =>
+      createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(eq(item.language, `hin`), eq(item.archived, true)),
+            ),
+      })
+
     it(`serves an eq-narrowed query locally from a loaded partition`, async () => {
       const queryFn = makeServerQueryFn()
       const collection = createContentCollection(`level3-eq`, queryFn, [
@@ -6754,14 +6759,7 @@ describe(`QueryCollection`, () => {
       const partition = await loadHindiPartition(collection)
       expect(queryFn).toHaveBeenCalledTimes(1)
 
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await flushPromises()
 
@@ -6915,14 +6913,7 @@ describe(`QueryCollection`, () => {
       // serving this locally would return a silent wrong empty result. Since
       // `archived` is not inclusion-safe, the gate forces a fetch, which
       // returns the true, non-empty answer.
-      const archivedQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.archived, true)),
-            ),
-      })
+      const archivedQuery = makeArchivedQuery(collection)
       await archivedQuery.preload()
 
       await vi.waitFor(() => {
@@ -6940,14 +6931,7 @@ describe(`QueryCollection`, () => {
       const collection = createContentCollection(`level3-default-off`, queryFn)
       const partition = await loadHindiPartition(collection)
 
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
 
       await vi.waitFor(() => {
@@ -6963,14 +6947,7 @@ describe(`QueryCollection`, () => {
       const collection = createContentCollection(`level3-true`, queryFn, true)
       const partition = await loadHindiPartition(collection)
 
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await flushPromises()
 
@@ -6989,28 +6966,14 @@ describe(`QueryCollection`, () => {
       const partition = await loadHindiPartition(collection)
 
       // difficulty is not excepted → served locally.
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await flushPromises()
       expect(queryFn).toHaveBeenCalledTimes(1)
       expect(hard.size).toBe(2)
 
       // archived is excepted → fetch.
-      const archivedQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.archived, true)),
-            ),
-      })
+      const archivedQuery = makeArchivedQuery(collection)
       await archivedQuery.preload()
       await vi.waitFor(() => {
         expect(queryFn).toHaveBeenCalledTimes(2)
@@ -7035,14 +6998,7 @@ describe(`QueryCollection`, () => {
       )
       const partition = await loadHindiPartition(collection)
 
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await flushPromises()
       expect(queryFn).toHaveBeenCalledTimes(1)
@@ -7054,14 +7010,7 @@ describe(`QueryCollection`, () => {
       expect(mentionsColumn(residuals[0], `difficulty`)).toBe(true)
       expect(mentionsColumn(residuals[0], `language`)).toBe(false)
 
-      const archivedQuery = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.archived, true)),
-            ),
-      })
+      const archivedQuery = makeArchivedQuery(collection)
       await archivedQuery.preload()
       await vi.waitFor(() => {
         expect(queryFn).toHaveBeenCalledTimes(2)
@@ -7079,14 +7028,7 @@ describe(`QueryCollection`, () => {
       ])
       const partition = await loadHindiPartition(collection)
 
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await flushPromises()
       expect(queryFn).toHaveBeenCalledTimes(1)
@@ -7122,14 +7064,7 @@ describe(`QueryCollection`, () => {
       // The partition's coverage must not outlive its rows (the failure mode
       // a monotonic coverage log would have): a new subset request has
       // nothing live to match and must fetch its own data.
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await vi.waitFor(() => {
         expect(queryFn).toHaveBeenCalledTimes(2)
@@ -7148,17 +7083,8 @@ describe(`QueryCollection`, () => {
       )
       const partition = await loadHindiPartition(collection)
 
-      const makeHardQuery = () =>
-        createLiveQueryCollection({
-          query: (q) =>
-            q
-              .from({ item: collection })
-              .where(({ item }: any) =>
-                and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-              ),
-        })
-      const first = makeHardQuery()
-      const second = makeHardQuery()
+      const first = makeHardQuery(collection)
+      const second = makeHardQuery(collection)
       await first.preload()
       await second.preload()
       await flushPromises()
@@ -7201,14 +7127,7 @@ describe(`QueryCollection`, () => {
         expect(queryFn).toHaveBeenCalledTimes(1)
       })
 
-      const hard = createLiveQueryCollection({
-        query: (q) =>
-          q
-            .from({ item: collection })
-            .where(({ item }: any) =>
-              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
-            ),
-      })
+      const hard = makeHardQuery(collection)
       await hard.preload()
       await vi.waitFor(() => {
         expect(queryFn).toHaveBeenCalledTimes(2)

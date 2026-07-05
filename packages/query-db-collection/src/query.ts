@@ -1,5 +1,5 @@
 import { QueryObserver, hashKey } from '@tanstack/query-core'
-import { deepEquals, isWhereSubset, walkExpression } from '@tanstack/db'
+import { IR, deepEquals, isWhereSubset, walkExpression } from '@tanstack/db'
 import {
   GetKeyRequiredError,
   QueryClientRequiredError,
@@ -13,7 +13,6 @@ import type {
   ChangeMessage,
   CollectionConfig,
   DeleteMutationFnParams,
-  IR,
   InsertMutationFnParams,
   LoadSubsetOptions,
   SyncConfig,
@@ -424,9 +423,9 @@ const flattenAndConjuncts = (
     : [where]
 
 /**
- * The residual of serving `requestWhere` from a load covering `loadedWhere`:
- * the conjuncts of the request that the loaded predicate does not already
- * guarantee (a conjunct C is guaranteed when loaded ⇒ C, i.e.
+ * The residual of serving a request from a load covering `loadedWhere`: the
+ * request's conjuncts that the loaded predicate does not already guarantee
+ * (a conjunct C is guaranteed when loaded ⇒ C, i.e.
  * `isWhereSubset(loadedWhere, C)`). These are exactly the axes on which the
  * request is stricter than the loaded query — the part evaluated locally.
  *
@@ -436,12 +435,10 @@ const flattenAndConjuncts = (
  * the local narrowing trusts.
  */
 const computeInclusionResidual = (
-  requestWhere: IR.BasicExpression<boolean>,
+  requestConjuncts: Array<IR.BasicExpression<boolean>>,
   loadedWhere: IR.BasicExpression<boolean> | undefined,
 ): Array<IR.BasicExpression<boolean>> =>
-  flattenAndConjuncts(requestWhere).filter(
-    (conjunct) => !isWhereSubset(loadedWhere, conjunct),
-  )
+  requestConjuncts.filter((conjunct) => !isWhereSubset(loadedWhere, conjunct))
 
 /** Dotted paths of all columns referenced by an expression. */
 const collectReferencedColumns = (expr: IR.BasicExpression): Array<string> => {
@@ -456,44 +453,33 @@ const collectReferencedColumns = (expr: IR.BasicExpression): Array<string> => {
 
 /**
  * The §3 correctness gate: is every residual conjunct safe to apply as a
- * local filter, per the collection's `dedupeQueriesOn` declaration?
- * Errs toward `false` (fetch): a conjunct referencing no recognizable column
- * cannot be attributed to a safe axis, so it fails the column-based forms.
+ * local filter, per the collection's `dedupeQueriesOn` declaration? (The
+ * blanket `true` form is short-circuited by the caller before the residual
+ * is computed.) Errs toward `false` (fetch): a conjunct referencing no
+ * recognizable column cannot be attributed to a safe axis, so it fails the
+ * column-based forms.
  */
 const isResidualSafe = (
   residual: Array<IR.BasicExpression<boolean>>,
-  dedupeQueriesOn: Exclude<DedupeQueriesOn, false>,
+  dedupeQueriesOn: Exclude<DedupeQueriesOn, boolean>,
 ): boolean => {
   if (residual.length === 0) {
     // The loaded query already guarantees every conjunct — nothing is
     // filtered locally, so no column is being trusted.
     return true
   }
-  if (dedupeQueriesOn === true) {
-    return true
-  }
   if (typeof dedupeQueriesOn === `function`) {
     const where =
-      residual.length === 1
-        ? residual[0]!
-        : ({
-            type: `func`,
-            name: `and`,
-            args: residual,
-          } as IR.BasicExpression<boolean>)
+      residual.length === 1 ? residual[0]! : new IR.Func(`and`, residual)
     return dedupeQueriesOn({ where })
   }
-  const referenced = residual.map(collectReferencedColumns)
-  if (referenced.some((columns) => columns.length === 0)) {
-    return false
-  }
-  return Array.isArray(dedupeQueriesOn)
-    ? referenced.every((columns) =>
-        columns.every((column) => dedupeQueriesOn.includes(column)),
-      )
-    : referenced.every((columns) =>
-        columns.every((column) => !dedupeQueriesOn.except.includes(column)),
-      )
+  const isSafeColumn = Array.isArray(dedupeQueriesOn)
+    ? (column: string) => dedupeQueriesOn.includes(column)
+    : (column: string) => !dedupeQueriesOn.except.includes(column)
+  return residual.every((conjunct) => {
+    const columns = collectReferencedColumns(conjunct)
+    return columns.length > 0 && columns.every(isSafeColumn)
+  })
 }
 
 /**
@@ -948,20 +934,26 @@ export function queryCollectionOptions(
   // Predicate-inclusion (level 3) state — only consulted when `dedupeQueriesOn`
   // is set.
   // ==========================================================================
-  // hashedQueryKey → the LoadSubsetOptions its live observer was created with.
-  // Entries live exactly as long as the observer (added on observer creation,
-  // removed wherever the observer is torn down). Tying coverage to live
-  // observers — rather than a monotonic log — is what keeps it honest: when a
-  // covering query unloads and its rows are GC'd, it leaves the registry, so
-  // later subset requests miss and fetch instead of serving vanished rows.
-  const loadedPredicates = new Map<string, LoadSubsetOptions>()
-
   // hashed subset-query key → stack of covering-query hashes it pinned, one
   // entry per loadSubset call served via inclusion. A served subset holds a
   // refcount on its covering query (not on itself: it has no observer), so the
   // covering rows outlive e.g. a route loader that tears down first. Each
   // unloadSubset pops one pin and releases that refcount.
+  //
+  // There is no separate coverage registry: the coverage source of truth is
+  // the live observer map itself (each observer carries its LoadSubsetOptions
+  // in `options.meta`). Tying coverage to live observers — rather than a
+  // monotonic log — is what keeps it honest: when a covering query unloads
+  // and its rows are GC'd, its observer is gone, so later subset requests
+  // miss and fetch instead of serving vanished rows.
   const servedByCoveringQuery = new Map<string, Array<string>>()
+
+  const incrementQueryRefCount = (hashedQueryKey: string) => {
+    queryRefCounts.set(
+      hashedQueryKey,
+      (queryRefCounts.get(hashedQueryKey) || 0) + 1,
+    )
+  }
 
   // Helper function to add a row to the internal state
   const addRow = (rowKey: string | number, hashedQueryKey: string) => {
@@ -1340,8 +1332,10 @@ export function queryCollectionOptions(
     /**
      * Predicate-inclusion (level 3) match: find a live query whose loaded
      * predicate covers `opts` and whose residual passes the inclusion-safe
-     * gate. Every `continue` errs toward fetching — worst case a redundant
-     * request, never wrong data.
+     * gate. The live observer map is the coverage source of truth (each
+     * observer carries its LoadSubsetOptions in `options.meta`), so coverage
+     * structurally cannot outlive the loaded rows. Every `continue` errs
+     * toward fetching — worst case a redundant request, never wrong data.
      */
     const findCoveringQueryHash = (
       opts: LoadSubsetOptions,
@@ -1349,9 +1343,15 @@ export function queryCollectionOptions(
       if (!dedupeQueriesOn || !opts.where) {
         return undefined
       }
-      for (const [coveringHash, loaded] of loadedPredicates) {
+      const requestConjuncts = flattenAndConjuncts(opts.where)
+      for (const [coveringHash, observer] of state.observers) {
+        const loaded = observer.options.meta?.loadSubsetOptions
+        if (!loaded) {
+          continue
+        }
         // MVP: only an unlimited, un-windowed load is a complete partition a
-        // narrower predicate can safely be answered from.
+        // narrower predicate can safely be answered from (§7.5: a future
+        // "fully loaded" flag could admit chunked partitions too).
         if (
           loaded.limit !== undefined ||
           loaded.offset !== undefined ||
@@ -1361,14 +1361,17 @@ export function queryCollectionOptions(
         }
         // Only serve from data that has actually landed (§5.4: still-loading
         // covering queries are skipped; the subset fetches its own data).
-        const observer = state.observers.get(coveringHash)
-        if (!observer?.getCurrentResult().isSuccess) {
+        if (!observer.getCurrentResult().isSuccess) {
           continue
         }
         if (!isWhereSubset(opts.where, loaded.where)) {
           continue
         }
-        const residual = computeInclusionResidual(opts.where, loaded.where)
+        if (dedupeQueriesOn === true) {
+          // Blanket trust: no need to attribute the residual to columns.
+          return coveringHash
+        }
+        const residual = computeInclusionResidual(requestConjuncts, loaded.where)
         if (!isResidualSafe(residual, dedupeQueriesOn)) {
           continue
         }
@@ -1422,6 +1425,12 @@ export function queryCollectionOptions(
       // Generate key using common function
       const key = generateQueryKeyFromOptions(opts)
       const hashedQueryKey = hashKey(key)
+      const retainedEntry = parsePersistedQueryRetentionEntry(
+        metadata?.collection.get(
+          `${QUERY_COLLECTION_GC_PREFIX}${hashedQueryKey}`,
+        ),
+        hashedQueryKey,
+      )
 
       // Predicate-inclusion short-circuit (level 3, opt-in via
       // `dedupeQueriesOn`): serve a strictly-narrower request from a live,
@@ -1431,37 +1440,25 @@ export function queryCollectionOptions(
       // is also excluded: its rows are pending revalidation and must be
       // reconciled by a real fetch, not covered over.
       if (
-        !state.observers.has(hashedQueryKey) &&
-        metadata?.collection.get(
-          `${QUERY_COLLECTION_GC_PREFIX}${hashedQueryKey}`,
-        ) === undefined
+        dedupeQueriesOn &&
+        opts.where &&
+        retainedEntry === undefined &&
+        !state.observers.has(hashedQueryKey)
       ) {
         const coveringHash = findCoveringQueryHash(opts)
         if (coveringHash !== undefined) {
           // Pin the covering query: the subset now depends on its rows, so it
           // must hold them live until the subset itself unloads (§5.3).
-          queryRefCounts.set(
-            coveringHash,
-            (queryRefCounts.get(coveringHash) || 0) + 1,
-          )
-          const pins = servedByCoveringQuery.get(hashedQueryKey)
-          if (pins) {
-            pins.push(coveringHash)
-          } else {
-            servedByCoveringQuery.set(hashedQueryKey, [coveringHash])
-          }
+          incrementQueryRefCount(coveringHash)
+          const pins = servedByCoveringQuery.get(hashedQueryKey) ?? []
+          pins.push(coveringHash)
+          servedByCoveringQuery.set(hashedQueryKey, pins)
           return true
         }
       }
 
       const extendedMeta = { ...meta, loadSubsetOptions: opts }
-      const retainedEntry = metadata?.collection.get(
-        `${QUERY_COLLECTION_GC_PREFIX}${hashedQueryKey}`,
-      )
-      if (
-        parsePersistedQueryRetentionEntry(retainedEntry, hashedQueryKey) !==
-        undefined
-      ) {
+      if (retainedEntry !== undefined) {
         retainedQueriesPendingRevalidation.add(hashedQueryKey)
       }
       cancelPersistedRetentionExpiry(hashedQueryKey)
@@ -1471,10 +1468,7 @@ export function queryCollectionOptions(
       if (state.observers.has(hashedQueryKey)) {
         // We already have a query for this queryKey
         // Increment reference count since another consumer is using this observer
-        queryRefCounts.set(
-          hashedQueryKey,
-          (queryRefCounts.get(hashedQueryKey) || 0) + 1,
-        )
+        incrementQueryRefCount(hashedQueryKey)
 
         // Get the current result and return based on its state
         const observer = state.observers.get(hashedQueryKey)!
@@ -1551,7 +1545,6 @@ export function queryCollectionOptions(
 
       hashToQueryKey.set(hashedQueryKey, key)
       state.observers.set(hashedQueryKey, localObserver)
-      loadedPredicates.set(hashedQueryKey, opts)
       if (effectivePersistedGcTime !== undefined) {
         effectivePersistedGcTimes.set(hashedQueryKey, effectivePersistedGcTime)
       } else {
@@ -1559,10 +1552,7 @@ export function queryCollectionOptions(
       }
 
       // Increment reference count for this query
-      queryRefCounts.set(
-        hashedQueryKey,
-        (queryRefCounts.get(hashedQueryKey) || 0) + 1,
-      )
+      incrementQueryRefCount(hashedQueryKey)
 
       // Check if data already exists in QueryClient cache (persisted within gcTime from
       // a previous observer). This avoids creating unnecessary promises and subscription
@@ -1911,16 +1901,19 @@ export function queryCollectionOptions(
       queryRefCounts.delete(hashedQueryKey)
       effectivePersistedGcTimes.delete(hashedQueryKey)
 
-      // Level-3 bookkeeping: the observer is gone, so its predicate no longer
-      // covers anything, and any pins on it (or held by it as a served subset)
-      // are void. The refcounts a pin represented die with the query.
-      loadedPredicates.delete(hashedQueryKey)
+      // Level-3 bookkeeping: any pins on the removed query (or held by it as
+      // a served subset) are void — the refcounts a pin represented die with
+      // the query. Coverage needs no bookkeeping: it lives in the observer
+      // map, and the observer was just deleted.
       servedByCoveringQuery.delete(hashedQueryKey)
       servedByCoveringQuery.forEach((pins, servedHash) => {
+        if (!pins.includes(hashedQueryKey)) {
+          return
+        }
         const remaining = pins.filter((pin) => pin !== hashedQueryKey)
         if (remaining.length === 0) {
           servedByCoveringQuery.delete(servedHash)
-        } else if (remaining.length !== pins.length) {
+        } else {
           servedByCoveringQuery.set(servedHash, remaining)
         }
       })
@@ -1990,12 +1983,12 @@ export function queryCollectionOptions(
         }
         unsubscribes.get(hashedQueryKey)?.()
         unsubscribes.delete(hashedQueryKey)
+        // Deleting the observer also removes this query from level-3
+        // coverage: retained rows are placeholders pending revalidation and
+        // must not serve predicate-inclusion matches.
         state.observers.delete(hashedQueryKey)
         hashToQueryKey.delete(hashedQueryKey)
         queryRefCounts.set(hashedQueryKey, 0)
-        // Retained rows are placeholders pending revalidation — they must not
-        // serve predicate-inclusion (level 3) matches.
-        loadedPredicates.delete(hashedQueryKey)
         return
       }
 
