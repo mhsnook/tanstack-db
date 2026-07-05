@@ -6833,6 +6833,77 @@ describe(`QueryCollection`, () => {
       innerHard.cleanup()
     })
 
+    it(`serves a filtered query locally from a loaded all-rows query`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-all-rows`, queryFn, [
+        `language`,
+      ])
+
+      // No where clause: covers everything → non-archived ids 1, 2, 4, 8, 15, 25.
+      const allRows = createLiveQueryCollection({
+        query: (q) => q.from({ item: collection }),
+      })
+      await allRows.preload()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(6)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // An undefined loaded where implies nothing, so the whole language
+      // filter is the residual — and `language` is safe, so it runs locally.
+      const ben = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => eq(item.language, `ben`)),
+      })
+      await ben.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(ben.size).toBe(2)
+      expect(ben.get(4)).toBeDefined()
+      expect(ben.get(15)).toBeDefined()
+
+      allRows.cleanup()
+      ben.cleanup()
+    })
+
+    it(`still fetches a filtered query from an all-rows load when the filter column is not safe`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(
+        `level3-all-rows-gate`,
+        queryFn,
+        [`difficulty`],
+      )
+
+      const allRows = createLiveQueryCollection({
+        query: (q) => q.from({ item: collection }),
+      })
+      await allRows.preload()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(6)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // Same residual as above, but `language` is outside the safe set. If the
+      // residual against an all-rows load were wrongly computed as empty, this
+      // would be served locally and the second call would never happen.
+      const ben = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => eq(item.language, `ben`)),
+      })
+      await ben.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(ben.size).toBe(2)
+      })
+
+      allRows.cleanup()
+      ben.cleanup()
+    })
+
     it(`still fetches when the residual touches a column outside the safe set (correctness gate)`, async () => {
       const queryFn = makeServerQueryFn()
       const collection = createContentCollection(`level3-gate`, queryFn, [
@@ -7029,6 +7100,81 @@ describe(`QueryCollection`, () => {
 
       // Subset tears down → pin released → covering query GCs its rows.
       await hard.cleanup()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(0)
+      })
+    })
+
+    it(`fetches again once the covering query has been torn down (coverage dies with the observer)`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-stale-cover`, queryFn, [
+        `difficulty`,
+      ])
+
+      // Load the partition, then tear it down completely: rows GC.
+      const partition = await loadHindiPartition(collection)
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      await partition.cleanup()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(0)
+      })
+
+      // The partition's coverage must not outlive its rows (the failure mode
+      // a monotonic coverage log would have): a new subset request has
+      // nothing live to match and must fetch its own data.
+      const hard = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
+            ),
+      })
+      await hard.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(hard.size).toBe(2)
+      })
+
+      hard.cleanup()
+    })
+
+    it(`releases one pin per unload when identical subset queries share a cover`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(
+        `level3-duplicate-pins`,
+        queryFn,
+        [`difficulty`],
+      )
+      const partition = await loadHindiPartition(collection)
+
+      const makeHardQuery = () =>
+        createLiveQueryCollection({
+          query: (q) =>
+            q
+              .from({ item: collection })
+              .where(({ item }: any) =>
+                and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
+              ),
+        })
+      const first = makeHardQuery()
+      const second = makeHardQuery()
+      await first.preload()
+      await second.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // Two identical subsets hold two pins, not one shared entry. Releasing
+      // the covering query and ONE subset must not drop the rows the other
+      // subset still shows.
+      await partition.cleanup()
+      await first.cleanup()
+      await flushPromises()
+      expect(collection.size).toBe(4)
+      expect(second.size).toBe(2)
+
+      // The last pin release lets the covering query clean up its rows.
+      await second.cleanup()
       await vi.waitFor(() => {
         expect(collection.size).toBe(0)
       })
