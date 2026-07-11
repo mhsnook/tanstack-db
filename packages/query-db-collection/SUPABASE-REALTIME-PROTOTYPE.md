@@ -1,13 +1,8 @@
-# Prototyping a Supabase-realtime bridge on a TanStack DB query collection
+# Partition-scoped Supabase realtime on a TanStack DB query collection
 
 **Audience:** the app codebase (a Supabase project) that wants live data on top
 of a `queryCollectionOptions` collection running in **on-demand** mode — built
 in-app first, extracted into a library later.
-
-**Mechanism:** classic realtime, i.e. `postgres_changes` subscriptions over the
-websocket, with server-side filters (`language=eq.hin`). No triggers, no topic
-conventions — the compiled predicate maps directly onto the subscription's
-filter string.
 
 **Context:** this fork (`mhsnook/tanstack-db`) has been building
 predicate-aware loading for query collections:
@@ -20,16 +15,28 @@ predicate-aware loading for query collections:
   on that branch.
 
 The idea: the collection already tracks, per live query, a compiled predicate
-(`LoadSubsetOptions.where`). Those same predicates can drive **which realtime
-subscriptions are open at any moment** — one filtered subscription per live
-partition, opened when the predicate loads, closed when it unloads. Once
-level 3 lands, narrow subset queries never create their own observers, so the
-only predicates that reach the network — and the only subscriptions you need —
-are the broad partitions.
+(`LoadSubsetOptions.where`). Those same predicates drive **which realtime
+subscriptions are open at any moment** — one per live partition, opened when
+the predicate loads, closed when it unloads.
 
-**Verdict from auditing the library internals: you can prototype this entirely
-in the app, with zero fork/library changes.** The seams below are all public
-API today.
+## 0. The design in one paragraph, and the verdict
+
+Almost everything here is **transport-independent**: extracting partitions
+from predicates, the subscription lifecycle, the join-gap buffering, the
+ingest rules, reconnect handling. That's the bridge core (§2–§3), and it's
+where all the interesting decisions live. The transport — Supabase broadcast
+vs. `postgres_changes` — is a ~20-line adapter behind a 3-method interface
+(§4). **Recommended default: the broadcast adapter (§4.1).** For public-facing
+fan-out it is correct by construction (the trigger controls fan-out, so
+partition-departures and deletes just work) and it's the substrate Supabase
+scales; its cost is one ~30-line SQL migration. The `postgres_changes` adapter
+(§4.2) needs no SQL, but is only fully correct with `REPLICA IDENTITY FULL`
+plus a companion unfiltered-UPDATE subscription — two workarounds to reach the
+behavior broadcast gives you for free. Use it if you want to defer migrations
+while messing around; nothing in the core changes when you swap.
+
+**You can build all of this in the app with zero fork/library changes.** The
+seams in §1 are public API today.
 
 ---
 
@@ -52,11 +59,8 @@ queryFn: async (ctx) => {
 
 `LoadSubsetOptions` is defined at
 [types.ts#L287](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/db/src/types.ts#L287)
-(`where`, `orderBy`, `limit`, `cursor`, `offset`).
-
-This is the **subscribe hook**: derive the realtime filter from `opts.where`,
-join the channel *before* running the select, and you get subscribe-then-fetch
-ordering for free (§3.3).
+(`where`, `orderBy`, `limit`, `cursor`, `offset`). This is the **subscribe
+hook**: derive the partition, join *before* running the select (§3.2).
 
 ### 1.2 Seeing predicates unload: QueryCache `removed` events
 
@@ -71,7 +75,7 @@ which the QueryCache broadcasts:
 ```ts
 queryClient.getQueryCache().subscribe((event) => {
   if (event.type === `removed` && isOurKey(event.query.queryKey)) {
-    releaseSubscriptionFor(event.query.queryHash)
+    bridge.release(event.query.queryHash)
   }
 })
 ```
@@ -88,271 +92,279 @@ loaded/unloaded predicate stream — the in-app stand-in for the level-3
 built exactly for "rows arrive over a websocket". Writes go straight into the
 synced store — no refetch round-trip.
 
-### 1.4 Checking rows against a predicate: `compileExpression`
+---
 
-`@tanstack/db` publicly exports `compileExpression`
-([evaluators.ts#L89](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/db/src/query/compiler/evaluators.ts#L89))
-to turn a `BasicExpression` into an evaluator, for testing incoming rows
-against the full `where` on ingest. For simple partitions,
-`record[partitionCol] === value` is equivalent and simpler.
+## 2. Partitions, not predicates, are the subscription unit
+
+Realtime transports can't express arbitrary predicate trees (broadcast has
+opaque topics; `postgres_changes` takes one single-column filter). Trying to
+push the whole `where` into the transport is the wrong goal. Instead:
+
+**Declare partition axes** per collection — the columns whose equality clauses
+define a "region" of the table:
+
+```ts
+partitionBy: ['language']   // → partitions like { column: 'language', value: 'hin' }
+```
+
+The bridge walks each loading predicate's `where` for `eq(partitionCol, val)`
+clauses (top-level or inside `and`) and subscribes at **partition
+granularity**. Everything narrower rides for free:
+
+- `language='hin' AND difficulty='hard'` subscribes to the `hin` partition.
+  Incoming rows that match the partition but not the residual are still
+  written to the collection — **that's correct, not sloppy**: the collection
+  is the synced store, and live queries filter on read. The narrow query
+  simply doesn't render them. No residual evaluation needed at ingest.
+- A predicate with no partition clause (or `or` across partitions) gets no
+  subscription — it still fetches and renders, it just isn't live. Err toward
+  not subscribing rather than subscribing to the whole table.
+- A predicate with a `limit` gets no subscription (a live insert can enter a
+  top-N window, but a row dropping *out* of the window can't be evicted
+  locally — mirrors the level-3 MVP rule of only matching unlimited covers).
+
+This is deliberately the same declaration the level-3 inclusion gate needs
+(`dedupeQueriesOn`): "these columns are honest partition axes." One config,
+two consumers. And once level 3 lands, narrow queries stop creating observers
+entirely, so the bridge naturally converges on one subscription per live
+covering partition, with refcount pinning (design doc §5.3) making
+subscription lifetime equal row retention — no bridge changes needed.
 
 ---
 
-## 2. Predicate → filter mapping
+## 3. The bridge core (transport-independent, ~120 lines)
 
-`postgres_changes` accepts **one filter string per subscription binding**, on
-**one column**: `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `in`. No compound
-`AND`/`OR` filters. So the mapping from a `where` tree is:
-
-- **Single clause on a supported op** → direct translation:
-  `eq(row.language, 'hin')` → `language=eq.hin`;
-  `inArray(row.id, [1,2,3])` → `id=in.(1,2,3)`.
-- **`and(...)` of clauses** → pick the clause on a **declared partition
-  column**, subscribe on that alone (`language=eq.hin`), and apply the residual
-  clauses client-side on ingest (§3.4). Subscribing slightly wide and
-  filtering locally is correct; it just delivers a few extra events.
-- **Anything else** (`or`, unsupported ops, no partition clause) → no
-  subscription; the query still works, it just isn't live. Err toward not
-  subscribing rather than subscribing to the whole table.
-
-Declare the partition axes per collection (`['language']`), same declaration
-the level-3 inclusion gate needs (`dedupeQueriesOn`) — one config, two
-consumers.
-
-**Scaling note, since this is public-facing:** the realtime server evaluates
-every change against every subscriber's filters and RLS. Supabase itself steers
-high-fan-out use toward broadcast for this reason. For a prototype and moderate
-traffic `postgres_changes` is fine — just know the ceiling exists, and that the
-bridge's *shape* (predicate in, subscription out) survives a later swap of
-transport.
-
----
-
-## 3. Client architecture
-
-Four small pieces, ~150 lines total in-app.
-
-### 3.1 Refcounted subscription manager
-
-Multiple predicates can map to the same filter (e.g. the partition and a
-narrow query over it, until level 3 exists). Key by the filter string:
+### 3.1 State
 
 ```ts
-type Sub = { channel: RealtimeChannel; refs: number; buffer: Array<Payload> | null }
-const subs = new Map<string, Sub>() // key: filter string, '' = unfiltered
+type Partition = { column: string; value: string }        // canonical key: `${column}=${value}`
+type Live = { close: () => void; refs: number; buffer: Array<PartitionEvent> | null }
 
-async function acquire(filter: string): Promise<void> {
-  const existing = subs.get(filter)
-  if (existing) { existing.refs++; return }
-  const channel = supabase.channel(`words:${filter || 'all'}`)
-  const sub: Sub = { channel, refs: 1, buffer: [] }
-  subs.set(filter, sub)
-  channel.on(
-    `postgres_changes`,
-    { event: `*`, schema: `public`, table: `words`, ...(filter && { filter }) },
-    (payload) => ingest(filter, payload),
-  )
-  await joined(channel) // subscribe(); resolve on SUBSCRIBED, reject on CHANNEL_ERROR/TIMED_OUT
-}
+const live = new Map<string, Live>()                      // partition key → subscription
+const partitionsByQueryHash = new Map<string, Array<string>>()
+```
 
-function release(filter: string) {
-  const sub = subs.get(filter)
-  if (!sub || --sub.refs > 0) return
-  supabase.removeChannel(sub.channel)
-  subs.delete(filter)
+### 3.2 Lifecycle
+
+```ts
+queryFn: async (ctx) => {
+  const opts = (ctx.meta?.loadSubsetOptions ?? {}) as LoadSubsetOptions
+  const partitions = extractPartitions(opts)              // §2 rules
+  partitionsByQueryHash.set(hashKey(ctx.queryKey), partitions.map(pKey))
+  await Promise.all(partitions.map(acquire))              // ① subscribe first
+  const rows = await selectFromSupabase(opts)             // ② then fetch
+  partitions.forEach(drainBuffer)                         // ③ then apply buffered events
+  return rows
 }
 ```
 
-### 3.2 Wiring into the collection
+`acquire` refcounts by partition key; on first acquire it calls
+`transport.open(partition, ingest, onResubscribe)` (§4 interface) with the
+buffer armed. `release` (driven by the QueryCache `removed` event, §1.2)
+decrements and closes at zero. `selectFromSupabase` translates `opts.where`
+to PostgREST filters (`.eq()`, `.gte()`, …) by walking the expression tree —
+same translation the fork's siblings do for their backends (electric's
+`compileSQL`, powersync's `sqlite-compiler`); implement `eq`/`and` + the
+comparison ops and throw on anything else until you need it.
+
+### 3.3 Ingest — one rule, consulting *all* live partitions
+
+All transports normalize events to:
 
 ```ts
-const filterByQueryHash = new Map<string, string | null>()
-
-const collection = createCollection(queryCollectionOptions({
-  queryKey: [`words`],
-  syncMode: `on-demand`,
-  queryClient,
-  getKey: (row) => row.id,
-  queryFn: async (ctx) => {
-    const opts = (ctx.meta?.loadSubsetOptions ?? {}) as LoadSubsetOptions
-    const filter = filterFor(opts.where)              // string | null (§2)
-    filterByQueryHash.set(hashKey(ctx.queryKey), filter) // hashKey from @tanstack/query-core
-    if (filter !== null) await acquire(filter)        // ① subscribe first
-    const rows = await selectFromSupabase(opts)       // ② then fetch
-    if (filter !== null) drainBuffer(filter)          // ③ then apply buffered events
-    return rows
-  },
-  ...
-}))
-
-queryClient.getQueryCache().subscribe((event) => {
-  if (event.type !== `removed`) return
-  const filter = filterByQueryHash.get(event.query.queryHash)
-  filterByQueryHash.delete(event.query.queryHash)
-  if (filter != null) release(filter)
-})
+type PartitionEvent =
+  | { op: 'INSERT' | 'UPDATE'; row: Row }
+  | { op: 'DELETE'; oldRow: Partial<Row> }   // at least the primary key
 ```
 
-`selectFromSupabase` translates `opts.where` to PostgREST filters (`.eq()`,
-`.gte()`, …) by walking the `BasicExpression` tree — same translation the
-fork's siblings do for their backends (electric's `compileSQL`, powersync's
-`sqlite-compiler`), just targeting supabase-js. Conveniently, `filterFor` and
-`selectFromSupabase` share the clause→PostgREST-operator translation; write it
-once. Start with `eq`/`and` plus the comparison ops and throw on anything you
-haven't implemented yet.
-
-### 3.3 Buffering across the join/fetch gap
-
-Realtime has no replay. Events can arrive between channel join and the initial
-select landing, and rows can change between the select executing and its
-response arriving. Ordering ① subscribe → ② fetch → ③ drain, with `ingest`
-appending to `buffer` while it's non-null, closes the gap. After drain, set
-`buffer = null` so events apply immediately. Applying a buffered event on top
-of freshly fetched rows is safe because upsert/delete by primary key is
-idempotent.
-
-### 3.4 Ingest
-
-`postgres_changes` payloads are `{ eventType: 'INSERT' | 'UPDATE' | 'DELETE',
-new, old }` (`old` contains only replica-identity columns unless you change
-that — §4):
-
 ```ts
-function ingest(filter: string, payload: RealtimePostgresChangesPayload<Word>) {
-  const sub = subs.get(filter)
-  if (sub?.buffer) { sub.buffer.push(payload); return }
+function ingest(partitionKey: string, e: PartitionEvent) {
+  const sub = live.get(partitionKey)
+  if (sub?.buffer) { sub.buffer.push(e); return }
   const { writeUpsert, writeDelete } = collection.utils
-  if (payload.eventType === `DELETE`) {
-    const key = payload.old?.id
-    if (key != null && collection.has(key)) writeDelete(key)
-  } else if (matchesResidual(filter, payload.new)) { // client-side residual check (§2)
-    writeUpsert(payload.new)
-  } else if (collection.has(payload.new.id)) {
-    writeDelete(payload.new.id) // updated row no longer matches the narrow predicate
+  if (e.op === `DELETE`) {
+    if (collection.has(getKey(e.oldRow))) writeDelete(getKey(e.oldRow))
+  } else if (matchesAnyLivePartition(e.row)) {   // NOT just this partition
+    writeUpsert(e.row)
+  } else if (collection.has(getKey(e.row))) {
+    writeDelete(getKey(e.row))                   // row left every live region
   }
 }
 ```
 
-### 3.5 Reconnects
+Checking against **all** live partitions (a few string comparisons) handles
+two edge cases with one rule: a row moving `hin → fra` while both partitions
+are live is upserted, not deleted; and with multiple partition axes (say
+`language` and `deck_id`), a row leaving one axis's region isn't dropped while
+another live region still contains it. Duplicate delivery (a move seen by both
+the old and new partition's subscriptions, or replays after rejoin) is
+harmless: upsert/delete by key is idempotent — which is also why it must be
+`writeUpsert`, not `writeInsert` (which throws on existing keys).
 
-supabase-js rejoins channels automatically after a drop, but events during the
-gap are lost. On re-`SUBSCRIBED` after a disconnect, re-arm the buffer and
-refetch the live predicates mapped to that filter —
-`collection.utils.refetch()` (or targeted `queryClient.invalidateQueries`)
-reconciles the synced store.
+### 3.4 Join gap and reconnects
 
----
+No realtime transport replays missed events, so two rules:
 
-## 4. Postgres side
-
-No triggers needed — but three settings matter, and one of them is a silent
-correctness trap.
-
-### 4.1 Enable the table for realtime
-
-```sql
-alter publication supabase_realtime add table public.words;
-```
-
-### 4.2 REPLICA IDENTITY FULL — required for filtered DELETEs (the trap)
-
-Filters are evaluated against the **new** record for INSERT/UPDATE and against
-the **old** record for DELETE. By default a table's replica identity is its
-primary key, so the old record on a DELETE contains *only the PK* — a filter
-like `language=eq.hin` can never match it, and **your filtered subscription
-silently receives no DELETE events at all**. Rows deleted on the server just
-linger in the collection.
-
-```sql
-alter table public.words replica identity full;
-```
-
-This makes old records carry all columns (so filtered DELETEs arrive, and
-UPDATE payloads include full `old`). Cost: extra WAL volume on writes to that
-table — fine for most tables, worth knowing on hot ones.
-
-### 4.3 RLS
-
-`postgres_changes` respects RLS per subscriber: each subscriber only receives
-rows their role can `select`. For public-facing data that means your `anon`
-select policy is doing double duty (REST reads *and* realtime delivery) —
-which is exactly what you want, no separate realtime authorization to
-maintain. Note the asymmetry: **DELETE events are not RLS-filtered** (there's
-no row left to check), so don't put anything sensitive in deletable rows' PKs.
-
-### 4.4 Rows leaving a partition
-
-An UPDATE that moves a row *out* of the partition (`language: 'hin' → 'fra'`)
-is filtered against the **new** record, so the `language=eq.hin` subscriber
-never hears about it → stale row stays in the collection. Options, in order of
-preference:
-
-1. **Partition columns are immutable** in your schema (common — a word's
-   language never changes): non-issue, state it and move on.
-2. If they can change, add **one extra unfiltered UPDATE-only subscription**
-   per table whose handler does nothing unless `collection.has(key)` — a
-   departure only matters for rows you already hold, and for held rows the
-   handler writes the update or deletes the row if it no longer matches. This
-   costs one wide subscription; the filtered ones still carry the arrivals.
-3. Accept staleness and rely on refetch-on-remount / periodic `refetch()`.
-
-(The broadcast-from-trigger approach solves this by broadcasting to both the
-old and new partition topics; with `postgres_changes` you don't control the
-fan-out, hence the workarounds.)
+- **Join gap:** the ① subscribe → ② fetch → ③ drain ordering above, with
+  events buffered per-partition until the initial select lands, closes the
+  window where a change commits after the select executes but before the
+  subscription is active. After drain, `buffer = null` and events apply
+  immediately.
+- **Reconnects:** supabase-js rejoins channels automatically, but the gap is
+  lossy. When the transport signals a re-join (`onResubscribe`), re-arm the
+  buffer and refetch the queries pinned to that partition
+  (`queryClient.invalidateQueries` by the recorded query hashes, or
+  `collection.utils.refetch()` for the blunt version), then drain.
 
 ---
 
-## 5. Known gotchas (found while auditing the library internals)
+## 4. Transport adapters
+
+The only transport-specific code:
+
+```ts
+interface RealtimeTransport {
+  open(
+    p: Partition,
+    onEvent: (e: PartitionEvent) => void,
+    onResubscribe: () => void,   // fired on re-join after a dropped connection
+  ): Promise<() => void>          // resolves once subscribed; returns close()
+}
+```
+
+### 4.1 Broadcast adapter — recommended default
+
+Partition → topic string: `words:language:hin`. Client side:
+
+```ts
+const channel = supabase.channel(`words:${p.column}:${p.value}`, { config: { private: true } })
+channel.on(`broadcast`, { event: `*` }, ({ payload }) =>
+  onEvent(normalize(payload)))    // payload: { operation, record, old_record, ... } — verify shape
+await joined(channel)             // subscribe(); resolve SUBSCRIBED, reject CHANNEL_ERROR/TIMED_OUT
+```
+
+Server side, one generic trigger function reused by every partitioned table —
+this is the piece that makes broadcast correct by construction, because *you*
+control the fan-out: when a partition column changes, it notifies **both** the
+old and new partition, and DELETE events carry the full old row:
+
+```sql
+create or replace function public.broadcast_partition_changes()
+returns trigger
+security definer
+language plpgsql
+set search_path = ''
+as $$
+declare
+  col text := tg_argv[0];
+  new_val text := case when tg_op in ('INSERT','UPDATE') then to_jsonb(new)->>col end;
+  old_val text := case when tg_op in ('UPDATE','DELETE') then to_jsonb(old)->>col end;
+  base text := tg_table_name || ':' || col || ':';
+begin
+  if new_val is not null then
+    perform realtime.broadcast_changes(base || new_val, tg_op, tg_op,
+      tg_table_name, tg_table_schema, new, old);
+  end if;
+  if old_val is not null and old_val is distinct from new_val then
+    perform realtime.broadcast_changes(base || old_val, tg_op, tg_op,
+      tg_table_name, tg_table_schema, new, old);
+  end if;
+  return null;
+end;
+$$;
+
+create trigger words_partition_broadcast
+  after insert or update or delete on public.words
+  for each row execute function public.broadcast_partition_changes('language');
+```
+
+Authorization is one RLS policy on `realtime.messages` (private channels check
+it at **join time**, once per subscriber — not per event, which is why this
+substrate scales):
+
+```sql
+create policy "public can listen to words partitions"
+  on realtime.messages for select
+  to anon, authenticated
+  using (extension = 'broadcast' and realtime.topic() like 'words:language:%');
+```
+
+The topic namespace is the authorization boundary — never broadcast a topic
+pattern wider than the policy. If some partitions are non-public, encode that
+in the policy, not the client.
+
+Why this is the default for a public-facing app: departures and deletes are
+handled in the trigger (no client workarounds), join-time authz + cheap
+fan-out is the mechanism Supabase recommends at scale, and the payload is
+yours to slim down later if whole rows get heavy. Total cost: the migration
+above.
+
+### 4.2 `postgres_changes` adapter — zero-SQL alternative
+
+Partition → filter string: `language=eq.hin`. The predicate feeds the
+subscription literally:
+
+```ts
+channel.on(`postgres_changes`,
+  { event: `*`, schema: `public`, table: `words`, filter: `${p.column}=eq.${p.value}` },
+  (payload) => onEvent(normalize(payload)))   // { eventType, new, old }
+```
+
+No migration, and per-subscriber RLS means your existing `anon` select policy
+does double duty. But two delivery gaps need patching before it's equivalent:
+
+1. **Filtered DELETEs are silently dropped by default.** DELETE filters match
+   against the *old* record, which only carries the primary key under the
+   default replica identity — `language=eq.hin` can never match, so deleted
+   rows linger. Fix: `alter table public.words replica identity full;`
+   (extra WAL on writes to that table — so much for "zero SQL").
+2. **Departures are invisible to the old partition.** UPDATE filters match the
+   *new* record only. Fix: the adapter registers **one** shared unfiltered
+   UPDATE-only subscription per table, feeding the same `ingest` — the §3.3
+   rule (held? matches any live partition?) already does the right thing with
+   it. Cost: every update on the table reaches every client.
+3. Scale ceiling: the realtime server evaluates each change against every
+   subscriber's filters and RLS. Fine for a prototype or modest traffic;
+   it's the part that falls over first under public fan-out.
+
+Legitimate uses: local dev before the migration lands, or tables where
+partition columns are immutable and deletes don't happen (then neither gap
+applies and it's genuinely free). Otherwise the two patches cost more than
+the broadcast trigger they're imitating.
+
+---
+
+## 5. Transport-independent gotchas (from auditing the library internals)
 
 1. **Realtime-written rows are unowned.** On-demand mode tracks which query
    loaded each row and GCs rows when their last owning query unloads. The
-   manual write utils do **not** register ownership — verified in
-   `manual-sync.ts`. So a row inserted via `writeUpsert` from a realtime event
-   survives its partition unloading (a small retention leak, never wrong
-   data). Acceptable for the prototype; the library-ification fix is to let
-   write utils attribute rows to a predicate/owner. Don't "fix" it by
-   `writeDelete`-ing on release — the row may legitimately be owned by another
-   live query.
-2. **Limits/orderBy don't compose with live inserts.** A predicate with
-   `limit` shows the top-N; a realtime insert that belongs in that window will
-   appear via `writeUpsert`, but a row that *drops out* of the window won't be
-   evicted. Prototype: only subscribe for **unlimited** predicates (mirrors
-   the level-3 MVP rule of matching unlimited covers only).
-3. **Missed DELETEs without `REPLICA IDENTITY FULL`** — see §4.2. This is the
-   one that produces silently-wrong UIs.
-4. **Duplicate events** (overlapping filtered + unfiltered subscriptions,
-   rejoins) are fine — ingest is idempotent by key — but only if `writeUpsert`
-   is used rather than `writeInsert` (which throws on existing keys).
-5. **Filter value encoding.** Filter strings are parsed server-side; values
-   containing commas/parens (esp. `in.(...)`) need care, and `eq.` on strings
-   is unquoted. Keep partition values to simple slugs/ids and this never
-   bites.
+   manual write utils do **not** register ownership (verified in
+   `manual-sync.ts`), so a row upserted from a realtime event survives its
+   partition unloading — a small retention leak, never wrong data. Fine for
+   the prototype; the library fix is letting write utils attribute rows to an
+   owner. Don't "fix" it by deleting on release — the row may be owned by
+   another live query.
+2. **Limits/orderBy don't compose with live events** — hence the §2 rule:
+   no subscription for limited predicates.
+3. **Filter/topic value encoding.** Partition values become topic segments or
+   filter strings. Keep them to slugs/ids; if a value can contain `:`  `,` or
+   parens, encode it (and mirror the encoding in the trigger).
 
 ---
 
 ## 6. What graduates into the library later
 
-When this gets extracted (either into the fork's query-db-collection work or a
-standalone `supabase-db-collection`):
-
-- **Registry event surface.** The level-3 design's `loadedPredicates` registry
-  (design doc §5.2) should expose `onPredicateLoaded/onPredicateUnloaded` —
-  then the bridge stops spying on the QueryCache and becomes a plain
-  subscriber. Designing that surface in from day one is cheap; this prototype
-  is the first consumer and will tell us what the events need to carry.
-- **Unified partition config.** `filterFor`'s partition columns and the
-  inclusion gate's `dedupeQueriesOn` are the same declaration ("these columns
-  are honest partition axes") — one config key, two consumers.
-- **Subscription-per-covering-partition.** Once level 3 lands, subset queries
-  stop creating observers, so the bridge naturally holds one subscription per
-  live partition, with refcount pinning (design doc §5.3) keeping subscription
-  lifetime equal to row retention. No bridge changes needed — it falls out of
-  the registry semantics.
+- **Registry event surface.** The level-3 `loadedPredicates` registry (design
+  doc §5.2) should expose `onPredicateLoaded/onPredicateUnloaded` — then the
+  bridge stops spying on the QueryCache and becomes a plain subscriber. This
+  prototype is the first consumer and will tell us what those events need to
+  carry.
+- **Unified partition config.** `partitionBy` here and the inclusion gate's
+  `dedupeQueriesOn` are the same declaration; one config key, two consumers.
 - **Row ownership for pushed writes** (gotcha #1).
-- **Transport swap.** If `postgres_changes` fan-out becomes the bottleneck,
-  the bridge's predicate-in/subscription-out shape ports to
-  broadcast-from-database — the filter derivation becomes a topic convention +
-  trigger. Nothing in the collection-facing half changes.
+- **The transport interface itself.** `RealtimeTransport` is the shape a
+  future `supabase-db-collection` (or any websocket-backed collection) wants;
+  the two adapters are its first implementations.
 
 ---
 
@@ -367,6 +379,6 @@ Pinned to [`816b667`](https://github.com/mhsnook/tanstack-db/tree/816b667c66c25b
 | predicate appended to queryKey (on-demand) | [query-db-collection/src/query.ts#L1056](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/query-db-collection/src/query.ts#L1056) |
 | cache entry removed on predicate GC | [query-db-collection/src/query.ts#L1672](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/query-db-collection/src/query.ts#L1672) |
 | manual write utils | [query-db-collection/src/manual-sync.ts#L244](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/query-db-collection/src/manual-sync.ts#L244) |
-| `compileExpression` (public) | [db/src/query/compiler/evaluators.ts#L89](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/db/src/query/compiler/evaluators.ts#L89) |
+| `compileExpression` (public, if full-predicate checks are ever needed) | [db/src/query/compiler/evaluators.ts#L89](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/db/src/query/compiler/evaluators.ts#L89) |
 | expression→backend-filter precedent | [electric `compileSQL`](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/electric-db-collection/src/electric.ts#L479), [powersync `sqlite-compiler`](https://github.com/mhsnook/tanstack-db/blob/816b667c66c25be5266dbb958a91e2e02e8b53a1/packages/powersync-db-collection/src/sqlite-compiler.ts) |
 | level-3 inclusion design | [PREDICATE-INCLUSION-DESIGN.md](https://github.com/mhsnook/tanstack-db/blob/claude/partition-aware-inclusion/packages/query-db-collection/PREDICATE-INCLUSION-DESIGN.md) (branch `claude/partition-aware-inclusion`) |
