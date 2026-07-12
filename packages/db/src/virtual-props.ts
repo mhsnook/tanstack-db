@@ -69,6 +69,23 @@ export interface VirtualRowProps<
   readonly $synced: boolean
 
   /**
+   * Whether the backend has *acknowledged* this row's pending write (accepted it),
+   * independent of whether it has finished syncing back ("settling").
+   *
+   * - `true`: the server has the write (the collection called `acknowledge()`), OR
+   *   the row is fully synced.
+   * - `false`: the write is still in flight; no confirmation yet.
+   *
+   * Always `true` when `$synced` is `true`. For local-only collections, always `true`.
+   * For collections without a separate ack signal, this coincides with `$synced`.
+   *
+   * This is the signal most UIs want for "drop the spinner". Library authors making
+   * real-time syncing collections need to hold on to the transaction until it syncs,
+   * but this is a data-transport concern; in many cases the UI can react sooner.
+   */
+  readonly $acknowledged: boolean
+
+  /**
    * Origin of the last confirmed change to this row, from the current client's perspective.
    *
    * - `'local'`: The change originated from this client
@@ -171,9 +188,11 @@ export function createVirtualProps<TKey extends string | number>(
   collectionId: string,
   isSynced: boolean,
   origin: VirtualOrigin,
+  isAcknowledged: boolean = isSynced,
 ): VirtualRowProps<TKey> {
   return {
     $synced: isSynced,
+    $acknowledged: isAcknowledged,
     $origin: origin,
     $key: key,
     $collectionId: collectionId,
@@ -207,6 +226,7 @@ export function enrichRowWithVirtualProps<
   collectionId: string,
   computeSynced: () => boolean,
   computeOrigin: () => VirtualOrigin,
+  computeAcknowledged: () => boolean = computeSynced,
 ): WithVirtualProps<T, TKey> {
   // Use nullish coalescing to preserve existing virtual properties (pass-through)
   // This is the "add-if-missing" pattern described in the RFC
@@ -215,6 +235,7 @@ export function enrichRowWithVirtualProps<
   return {
     ...row,
     $synced: existingRow.$synced ?? computeSynced(),
+    $acknowledged: existingRow.$acknowledged ?? computeAcknowledged(),
     $origin: existingRow.$origin ?? computeOrigin(),
     $key: existingRow.$key ?? key,
     $collectionId: existingRow.$collectionId ?? collectionId,
@@ -243,11 +264,17 @@ export function computeAggregateVirtualProps<TKey extends string | number>(
   // $synced = true only if ALL rows are synced (false if ANY is optimistic)
   const allSynced = rows.every((row) => row.$synced ?? true)
 
+  // $acknowledged = true only if ALL rows are acknowledged (server has all of them)
+  const allAcknowledged = rows.every(
+    (row) => row.$acknowledged ?? row.$synced ?? true,
+  )
+
   // $origin = 'local' if ANY row is local (consistent with "local influence" semantics)
   const hasLocal = rows.some((row) => row.$origin === 'local')
 
   return {
     $synced: allSynced,
+    $acknowledged: allAcknowledged,
     $origin: hasLocal ? 'local' : 'remote',
     $key: groupKey,
     $collectionId: collectionId,
@@ -260,6 +287,7 @@ export function computeAggregateVirtualProps<TKey extends string | number>(
  */
 export const VIRTUAL_PROP_NAMES = [
   '$synced',
+  '$acknowledged',
   '$origin',
   '$key',
   '$collectionId',

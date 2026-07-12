@@ -883,7 +883,13 @@ export function electricCollectionOptions<T extends Row<unknown>>(
         >,
       ) => {
         const handlerResult = await config.onInsert!(params)
-        await processMatchingStrategy(handlerResult)
+        // The server has accepted the write (ack). Hand the settle (awaiting the
+        // txid in the sync stream) to the framework, which flips $acknowledged on
+        // return and holds the optimistic overlay until it resolves. The handler
+        // returns at the ack; isSettled/isPersisted still fire at settle.
+        params.transaction.settleWith(() =>
+          processMatchingStrategy(handlerResult),
+        )
         return handlerResult
       }
     : undefined
@@ -897,7 +903,9 @@ export function electricCollectionOptions<T extends Row<unknown>>(
         >,
       ) => {
         const handlerResult = await config.onUpdate!(params)
-        await processMatchingStrategy(handlerResult)
+        params.transaction.settleWith(() =>
+          processMatchingStrategy(handlerResult),
+        )
         return handlerResult
       }
     : undefined
@@ -911,7 +919,9 @@ export function electricCollectionOptions<T extends Row<unknown>>(
         >,
       ) => {
         const handlerResult = await config.onDelete!(params)
-        await processMatchingStrategy(handlerResult)
+        params.transaction.settleWith(() =>
+          processMatchingStrategy(handlerResult),
+        )
         return handlerResult
       }
     : undefined
