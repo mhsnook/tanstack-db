@@ -2,12 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { QueryClient, hashKey } from '@tanstack/query-core'
 import {
   BTreeIndex,
+  and,
+  compileSingleRowExpression,
   createCollection,
   createLiveQueryCollection,
   eq,
+  gte,
   ilike,
   inArray,
+  lte,
   or,
+  walkExpression,
 } from '@tanstack/db'
 import {
   mockSyncCollectionOptions,
@@ -6513,6 +6518,773 @@ describe(`QueryCollection`, () => {
       taskQuery.cleanup()
       projectQuery.cleanup()
       customQueryClient.clear()
+    })
+  })
+
+  describe(`Load-by-key cache short-circuit (on-demand)`, () => {
+    const seedItems: Array<CategorisedItem> = [
+      { id: `1`, name: `Item 1`, category: `A` },
+      { id: `2`, name: `Item 2`, category: `A` },
+      { id: `3`, name: `Item 3`, category: `B` },
+    ]
+
+    const isCategoryAWhere = (where: any) =>
+      where?.type === `func` &&
+      where.name === `eq` &&
+      where.args[0]?.path?.[0] === `category` &&
+      where.args[1]?.value === `A`
+
+    const isIdWhere = (where: any, name: `eq` | `in`) =>
+      where?.type === `func` &&
+      where.name === name &&
+      where.args[0]?.path?.[0] === `id`
+
+    // queryFn that resolves data based on the predicate passed via loadSubsetOptions.
+    const makeQueryFn = () =>
+      vi.fn().mockImplementation((context: QueryFunctionContext) => {
+        const where = (context.meta?.loadSubsetOptions as any)?.where
+        if (isCategoryAWhere(where)) {
+          return Promise.resolve(
+            seedItems.filter((item) => item.category === `A`),
+          )
+        }
+        if (isIdWhere(where, `eq`)) {
+          const id = where.args[1].value
+          return Promise.resolve(seedItems.filter((item) => item.id === id))
+        }
+        if (isIdWhere(where, `in`)) {
+          const ids: Array<string> = where.args[1].value
+          return Promise.resolve(seedItems.filter((item) => ids.includes(item.id)))
+        }
+        return Promise.resolve([])
+      })
+
+    const createOnDemandCollection = (id: string, queryFn: any) =>
+      createCollection(
+        queryCollectionOptions({
+          id,
+          queryClient,
+          queryKey: (ctx: any) => (ctx.where ? [id, ctx.where] : [id]),
+          queryFn,
+          getKey,
+          startSync: true,
+          syncMode: `on-demand`,
+        } as QueryCollectionConfig<CategorisedItem>),
+      )
+
+    // Every test starts from the same state: a category A list query loaded
+    // (items 1 and 2 in the collection) via a single queryFn call.
+    const setupWithCategoryAListLoaded = async (id: string) => {
+      const queryFn = makeQueryFn()
+      const collection = createOnDemandCollection(id, queryFn)
+      const listQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => eq(item.category, `A`)),
+      })
+      await listQuery.preload()
+      await vi.waitFor(() => {
+        expect(collection.has(`1`)).toBe(true)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      return { collection, queryFn, listQuery }
+    }
+
+    it(`does not issue a new request for an eq key lookup when the key is already cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-eq`)
+
+      // A by-key live query for an already-cached key must reuse the cached row
+      // and NOT trigger a new request, even though its query key differs.
+      const byKeyQuery = createLiveQueryCollection({
+        query: (q) =>
+          q.from({ item: collection }).where(({ item }) => eq(item.id, `1`)),
+      })
+      await byKeyQuery.preload()
+
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(byKeyQuery.size).toBe(1)
+      expect(byKeyQuery.get(`1`)?.name).toBe(`Item 1`)
+
+      listQuery.cleanup()
+      byKeyQuery.cleanup()
+    })
+
+    it(`does not issue a new request for an inArray key lookup when all keys are cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-in`)
+      expect(collection.has(`2`)).toBe(true)
+
+      const byKeysQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => inArray(item.id, [`1`, `2`])),
+      })
+      await byKeysQuery.preload()
+
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(byKeysQuery.size).toBe(2)
+
+      listQuery.cleanup()
+      byKeysQuery.cleanup()
+    })
+
+    it(`still issues a request for a key lookup when the key is not cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-miss`)
+
+      // Item 3 (category B) was never loaded, so a by-key lookup must fetch it.
+      const byKeyQuery = createLiveQueryCollection({
+        query: (q) =>
+          q.from({ item: collection }).where(({ item }) => eq(item.id, `3`)),
+      })
+      await byKeyQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(byKeyQuery.size).toBe(1)
+      })
+      expect(byKeyQuery.get(`3`)?.name).toBe(`Item 3`)
+
+      listQuery.cleanup()
+      byKeyQuery.cleanup()
+    })
+
+    it(`does not short-circuit when the key clause is nested inside an or`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-or`)
+
+      // The key eq is buried in an `or` branch, so the result also depends on the
+      // `category = 'B'` branch, which we have NOT loaded. The cache is not
+      // authoritative here, so a request must still be issued.
+      const orQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) =>
+              or(
+                eq(item.category, `B`),
+                and(eq(item.id, `1`), eq(item.category, `A`)),
+              ),
+            ),
+      })
+      await orQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+      })
+
+      listQuery.cleanup()
+      orQuery.cleanup()
+    })
+
+    it(`still issues a request when only some keys in an inArray lookup are cached`, async () => {
+      const { collection, queryFn, listQuery } =
+        await setupWithCategoryAListLoaded(`short-circuit-partial`)
+
+      // `1` is cached but `3` is not, so the lookup can't be served locally.
+      const byKeysQuery = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }) => inArray(item.id, [`1`, `3`])),
+      })
+      await byKeysQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(byKeysQuery.size).toBe(2)
+      })
+
+      listQuery.cleanup()
+      byKeysQuery.cleanup()
+    })
+  })
+
+  describe(`Predicate-inclusion dedupe (on-demand)`, () => {
+    interface ContentItem {
+      id: number
+      language: string
+      difficulty: string
+      archived: boolean
+    }
+
+    const contentItems: Array<ContentItem> = [
+      { id: 1, language: `hin`, difficulty: `easy`, archived: false },
+      { id: 2, language: `hin`, difficulty: `hard`, archived: false },
+      { id: 3, language: `hin`, difficulty: `hard`, archived: true },
+      { id: 4, language: `ben`, difficulty: `easy`, archived: false },
+      { id: 8, language: `hin`, difficulty: `easy`, archived: false },
+      { id: 15, language: `ben`, difficulty: `hard`, archived: false },
+      { id: 25, language: `hin`, difficulty: `hard`, archived: false },
+    ]
+
+    // Evaluate a where expression the way a faithful backend would — using
+    // the canonical evaluator, so the mock server's comparison semantics
+    // can't drift from the real ones.
+    const evalWhere = (where: any, item: any): boolean =>
+      !where || Boolean(compileSingleRowExpression(where)(item))
+
+    const mentionsColumn = (expr: any, column: string): boolean => {
+      let found = false
+      walkExpression(expr, (node: any) => {
+        if (node.type === `ref` && node.path?.join(`.`) === column) {
+          found = true
+        }
+      })
+      return found
+    }
+
+    // A server with a hidden, non-monotonic filter (design doc §3): archived
+    // rows are excluded unless the query mentions `archived` explicitly. This
+    // makes `language='hin' AND archived=true` algebraically a subset of
+    // `language='hin'` while its true result is disjoint from the loaded rows.
+    const makeServerQueryFn = () =>
+      vi.fn().mockImplementation((context: QueryFunctionContext) => {
+        const where = (context.meta?.loadSubsetOptions as any)?.where
+        const includeArchived = mentionsColumn(where, `archived`)
+        return Promise.resolve(
+          contentItems.filter(
+            (item) =>
+              evalWhere(where, item) && (includeArchived || !item.archived),
+          ),
+        )
+      })
+
+    const createContentCollection = (
+      id: string,
+      queryFn: any,
+      dedupeQueriesOn?: unknown,
+    ) =>
+      createCollection(
+        queryCollectionOptions({
+          id,
+          queryClient,
+          queryKey: (ctx: any) => {
+            const key: Array<unknown> = [id]
+            if (ctx.where) key.push(`where`, JSON.stringify(ctx.where))
+            if (ctx.limit !== undefined) key.push(`limit`, String(ctx.limit))
+            if (ctx.orderBy) key.push(`orderBy`, JSON.stringify(ctx.orderBy))
+            return key
+          },
+          queryFn,
+          getKey: (item: ContentItem) => item.id,
+          startSync: true,
+          syncMode: `on-demand`,
+          autoIndex: `eager`,
+          defaultIndexType: BTreeIndex,
+          ...(dedupeQueriesOn !== undefined && { dedupeQueriesOn }),
+        } as QueryCollectionConfig<ContentItem>),
+      )
+
+    // The covering query most tests start from: the whole Hindi partition,
+    // held open like a route loader would. Loads ids 1, 2, 8, 25 (3 is
+    // archived and hidden by the server).
+    const loadHindiPartition = async (collection: any) => {
+      const partition = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => eq(item.language, `hin`)),
+      })
+      await partition.preload()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(4)
+      })
+      return partition
+    }
+
+    // The canonical narrowing queries the tests probe with: a subset on a
+    // typically-safe column (difficulty) and one on the server's hidden
+    // filter column (archived).
+    const makeHardQuery = (
+      collection: ReturnType<typeof createContentCollection>,
+    ) =>
+      createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(eq(item.language, `hin`), eq(item.difficulty, `hard`)),
+            ),
+      })
+
+    const makeArchivedQuery = (
+      collection: ReturnType<typeof createContentCollection>,
+    ) =>
+      createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(eq(item.language, `hin`), eq(item.archived, true)),
+            ),
+      })
+
+    it(`serves an eq-narrowed query locally from a loaded partition`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-eq`, queryFn, [
+        `difficulty`,
+      ])
+      const partition = await loadHindiPartition(collection)
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await flushPromises()
+
+      // Served from the partition: no new request, correct rows.
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(hard.size).toBe(2)
+      expect(hard.get(2)?.difficulty).toBe(`hard`)
+      expect(hard.get(25)?.difficulty).toBe(`hard`)
+
+      partition.cleanup()
+      hard.cleanup()
+    })
+
+    it(`serves range-narrowed queries locally from a loaded range partition`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-range`, queryFn, [
+        `id`,
+        `difficulty`,
+      ])
+
+      // Load id BETWEEN 1 AND 20 → non-archived ids 1, 2, 4, 8, 15.
+      const rangePartition = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => and(gte(item.id, 1), lte(item.id, 20))),
+      })
+      await rangePartition.preload()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(5)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // id BETWEEN 5 AND 10 — pure range narrowing.
+      const innerWindow = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => and(gte(item.id, 5), lte(item.id, 10))),
+      })
+      await innerWindow.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(innerWindow.size).toBe(1)
+      expect(innerWindow.get(8)).toBeDefined()
+
+      // Range narrowing combined with an eq filter.
+      const innerHard = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(
+                gte(item.id, 1),
+                lte(item.id, 16),
+                eq(item.difficulty, `hard`),
+              ),
+            ),
+      })
+      await innerHard.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(innerHard.size).toBe(2)
+      expect(innerHard.get(2)).toBeDefined()
+      expect(innerHard.get(15)).toBeDefined()
+
+      rangePartition.cleanup()
+      innerWindow.cleanup()
+      innerHard.cleanup()
+    })
+
+    it(`serves a filtered query locally from a loaded all-rows query`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-all-rows`, queryFn, [
+        `language`,
+      ])
+
+      // No where clause: covers everything → non-archived ids 1, 2, 4, 8, 15, 25.
+      const allRows = createLiveQueryCollection({
+        query: (q) => q.from({ item: collection }),
+      })
+      await allRows.preload()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(6)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // An undefined loaded where implies nothing, so the whole language
+      // filter is the residual — and `language` is safe, so it runs locally.
+      const ben = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => eq(item.language, `ben`)),
+      })
+      await ben.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(ben.size).toBe(2)
+      expect(ben.get(4)).toBeDefined()
+      expect(ben.get(15)).toBeDefined()
+
+      allRows.cleanup()
+      ben.cleanup()
+    })
+
+    it(`still fetches a filtered query from an all-rows load when the filter column is not safe`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(
+        `level3-all-rows-gate`,
+        queryFn,
+        [`difficulty`],
+      )
+
+      const allRows = createLiveQueryCollection({
+        query: (q) => q.from({ item: collection }),
+      })
+      await allRows.preload()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(6)
+      })
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // Same residual as above, but `language` is outside the safe set. If the
+      // residual against an all-rows load were wrongly computed as empty, this
+      // would be served locally and the second call would never happen.
+      const ben = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => eq(item.language, `ben`)),
+      })
+      await ben.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(ben.size).toBe(2)
+      })
+
+      allRows.cleanup()
+      ben.cleanup()
+    })
+
+    it(`still fetches when the residual touches a column outside the safe set (correctness gate)`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-gate`, queryFn, [
+        `difficulty`,
+      ])
+      const partition = await loadHindiPartition(collection)
+
+      // The loaded partition holds no archived rows (the server hid them), so
+      // serving this locally would return a silent wrong empty result. Since
+      // `archived` is not inclusion-safe, the gate forces a fetch, which
+      // returns the true, non-empty answer.
+      const archivedQuery = makeArchivedQuery(collection)
+      await archivedQuery.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(archivedQuery.size).toBe(1)
+      })
+      expect(archivedQuery.get(3)?.archived).toBe(true)
+
+      partition.cleanup()
+      archivedQuery.cleanup()
+    })
+
+    it(`is off by default: subset queries fetch when dedupeQueriesOn is absent`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-default-off`, queryFn)
+      const partition = await loadHindiPartition(collection)
+
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+      })
+
+      partition.cleanup()
+      hard.cleanup()
+    })
+
+    it(`dedupeQueriesOn: true trusts narrowing on any column`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-true`, queryFn, true)
+      const partition = await loadHindiPartition(collection)
+
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await flushPromises()
+
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(hard.size).toBe(2)
+
+      partition.cleanup()
+      hard.cleanup()
+    })
+
+    it(`dedupeQueriesOn: { except } trusts everything but the excepted columns`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-except`, queryFn, {
+        except: [`archived`],
+      })
+      const partition = await loadHindiPartition(collection)
+
+      // difficulty is not excepted → served locally.
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(hard.size).toBe(2)
+
+      // archived is excepted → fetch.
+      const archivedQuery = makeArchivedQuery(collection)
+      await archivedQuery.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(archivedQuery.size).toBe(1)
+      })
+
+      partition.cleanup()
+      hard.cleanup()
+      archivedQuery.cleanup()
+    })
+
+    it(`dedupeQueriesOn: fn receives only the narrowing residual and decides`, async () => {
+      const queryFn = makeServerQueryFn()
+      const residuals: Array<any> = []
+      const collection = createContentCollection(
+        `level3-fn`,
+        queryFn,
+        (residual: any) => {
+          residuals.push(residual.where)
+          return !mentionsColumn(residual.where, `archived`)
+        },
+      )
+      const partition = await loadHindiPartition(collection)
+
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(hard.size).toBe(2)
+
+      // The fn saw the residual: the difficulty narrowing, but NOT the
+      // language conjunct the covering query already guarantees.
+      expect(residuals.length).toBeGreaterThan(0)
+      expect(mentionsColumn(residuals[0], `difficulty`)).toBe(true)
+      expect(mentionsColumn(residuals[0], `language`)).toBe(false)
+
+      const archivedQuery = makeArchivedQuery(collection)
+      await archivedQuery.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+      })
+
+      partition.cleanup()
+      hard.cleanup()
+      archivedQuery.cleanup()
+    })
+
+    it(`pins the covering query: rows survive its teardown while the subset is mounted`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-pin`, queryFn, [
+        `difficulty`,
+      ])
+      const partition = await loadHindiPartition(collection)
+
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // Route-loader pattern: the broad query tears down first. The subset
+      // pinned it, so the partition's rows must remain.
+      await partition.cleanup()
+      await flushPromises()
+      expect(collection.size).toBe(4)
+      expect(hard.size).toBe(2)
+
+      // Subset tears down → pin released → covering query GCs its rows.
+      await hard.cleanup()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(0)
+      })
+    })
+
+    it(`fetches again once the covering query has been torn down (coverage dies with the observer)`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-stale-cover`, queryFn, [
+        `difficulty`,
+      ])
+
+      // Load the partition, then tear it down completely: rows GC.
+      const partition = await loadHindiPartition(collection)
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      await partition.cleanup()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(0)
+      })
+
+      // The partition's coverage must not outlive its rows (the failure mode
+      // a monotonic coverage log would have): a new subset request has
+      // nothing live to match and must fetch its own data.
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(hard.size).toBe(2)
+      })
+
+      hard.cleanup()
+    })
+
+    it(`releases one pin per unload when identical subset queries share a cover`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(
+        `level3-duplicate-pins`,
+        queryFn,
+        [`difficulty`],
+      )
+      const partition = await loadHindiPartition(collection)
+
+      const first = makeHardQuery(collection)
+      const second = makeHardQuery(collection)
+      await first.preload()
+      await second.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+
+      // Two identical subsets hold two pins, not one shared entry. Releasing
+      // the covering query and ONE subset must not drop the rows the other
+      // subset still shows.
+      await partition.cleanup()
+      await first.cleanup()
+      await flushPromises()
+      expect(collection.size).toBe(4)
+      expect(second.size).toBe(2)
+
+      // The last pin release lets the covering query clean up its rows.
+      await second.cleanup()
+      await vi.waitFor(() => {
+        expect(collection.size).toBe(0)
+      })
+    })
+
+    it(`does not match against a limited covering query`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-limited`, queryFn, [
+        `difficulty`,
+      ])
+
+      // A limited load is not a complete partition, so it cannot cover
+      // narrower predicates (MVP skips it conservatively).
+      const limited = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) => eq(item.language, `hin`))
+            .orderBy(({ item }: any) => item.id, `asc`)
+            .limit(2),
+      })
+      await limited.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(1)
+      })
+
+      const hard = makeHardQuery(collection)
+      await hard.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+      })
+
+      limited.cleanup()
+      hard.cleanup()
+    })
+
+    it(`serves an or-residual across safe columns, fetches when it touches an unsafe one`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-or-residual`, queryFn, [
+        `difficulty`,
+        `id`,
+      ])
+      const partition = await loadHindiPartition(collection)
+
+      // The residual is a single or() conjunct; both its columns are safe,
+      // so it can be applied locally.
+      const safeOr = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(
+                eq(item.language, `hin`),
+                or(eq(item.difficulty, `hard`), lte(item.id, 1)),
+              ),
+            ),
+      })
+      await safeOr.preload()
+      await flushPromises()
+      expect(queryFn).toHaveBeenCalledTimes(1)
+      expect(safeOr.size).toBe(3)
+
+      // Same shape, but the or() reaches an unsafe column → conservative fetch.
+      const unsafeOr = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              and(
+                eq(item.language, `hin`),
+                or(eq(item.difficulty, `hard`), eq(item.archived, true)),
+              ),
+            ),
+      })
+      await unsafeOr.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(unsafeOr.size).toBe(3)
+      })
+      expect(unsafeOr.get(3)?.archived).toBe(true)
+
+      partition.cleanup()
+      safeOr.cleanup()
+      unsafeOr.cleanup()
+    })
+
+    it(`does not serve an or across partitions (not a subset)`, async () => {
+      const queryFn = makeServerQueryFn()
+      const collection = createContentCollection(`level3-or-partition`, queryFn, [
+        `language`,
+        `difficulty`,
+      ])
+      const partition = await loadHindiPartition(collection)
+
+      // hin OR ben is wider than the loaded hin partition — the ben branch
+      // was never loaded, so this must fetch.
+      const twoLanguages = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ item: collection })
+            .where(({ item }: any) =>
+              or(eq(item.language, `hin`), eq(item.language, `ben`)),
+            ),
+      })
+      await twoLanguages.preload()
+      await vi.waitFor(() => {
+        expect(queryFn).toHaveBeenCalledTimes(2)
+        expect(twoLanguages.size).toBe(6)
+      })
+
+      partition.cleanup()
+      twoLanguages.cleanup()
     })
   })
 })

@@ -4,6 +4,7 @@ export type { QueryCollectionMeta } from './global'
 
 export {
   queryCollectionOptions,
+  type DedupeQueriesOn,
   type QueryCollectionConfig,
   type QueryCollectionUtils,
   type SyncOperation,

@@ -912,3 +912,73 @@ queryKey: (opts) => {
 2. **Use custom handlers** via `parseWhereExpression` for APIs with specific formats
 3. **Handle unsupported operators** with the `onUnknownOperator` callback
 4. **Log parsed results** during development to verify correctness
+
+## Deduplicating Queries with `dedupeQueriesOn`
+
+In `syncMode: 'on-demand'`, each distinct set of `loadSubsetOptions` normally
+results in its own request to your `queryFn`. Often, though, a narrower query is
+a strict subset of one you have already loaded: if a live query for
+`language = 'hin'` is mounted and holding its rows, a new query for
+`language = 'hin' AND difficulty = 'hard'` can be answered entirely from those
+rows — no request needed.
+
+The `dedupeQueriesOn` option opts a collection into this **predicate-inclusion
+deduplication**. When a new query's predicate is a subset of an already-loaded,
+still-live query's predicate, the collection serves it locally from the covering
+query's rows instead of calling `queryFn`.
+
+```typescript
+const contentCollection = createCollection(
+  queryCollectionOptions({
+    queryKey: ['content'],
+    queryClient,
+    getKey: (item) => item.id,
+    syncMode: 'on-demand',
+    queryFn: async (ctx) => {
+      const { where } = ctx.meta.loadSubsetOptions
+      return fetchContent(where)
+    },
+    // `language` and `difficulty` are plain, subtractive server filters,
+    // so narrowing on them can be applied locally.
+    dedupeQueriesOn: ['language', 'difficulty'],
+  })
+)
+```
+
+### Why the safety declaration matters
+
+Serving a subset locally is only correct if narrowing on a column *removes* rows
+and never *adds* them. Some backends apply hidden, non-monotonic filtering — a
+soft-delete scope that hides archived rows unless you explicitly ask for them,
+an auth scope, or a default filter. On such columns, a query like
+`language = 'hin' AND archived = true` *looks* like a subset of
+`language = 'hin'` but its true result set is disjoint from the loaded rows.
+Serving it locally would return nothing (or wrong data).
+
+Because the collection cannot see your server's behavior, you declare which
+columns are safe to narrow on locally — the *residual* being the part of the
+predicate applied against loaded rows rather than sent to the server.
+
+The misconfiguration risk is asymmetric: **omitting a safe column** only costs a
+redundant fetch, while **declaring an unsafe column safe** silently serves
+incomplete results. When in doubt, leave a column out.
+
+### Accepted forms
+
+| Value | Meaning |
+| --- | --- |
+| absent / `false` | **Default.** Deduplication off; every query fetches. No behavior change. |
+| `['language', 'difficulty']` | **Allowlist (recommended).** Only these columns are inclusion-safe. Use dotted paths (`'author.id'`) for nested fields. A residual touching any other column falls back to a fetch. |
+| `true` | Every column is a faithful, monotonic filter — trust all narrowing. |
+| `{ except: ['archived', 'visibility'] }` | Trust every column *except* these. Convenient when a backend is faithful apart from a few scopes, but a forgotten unsafe column serves incomplete data — prefer the allowlist. |
+| `(residual) => boolean` | Escape hatch for rules that aren't a flat column set. Receives the residual predicate as `{ where }`; return `true` to serve locally. |
+
+### Lifecycle and pinning
+
+A locally-served subset does not create its own query observer. Instead it
+**pins** its covering query via the collection's refcount machinery, so the
+covering rows survive the broad query's teardown while the subset is still
+mounted (the route-loader pattern, where a list view unmounts as a detail view
+mounts). Once the covering query unloads and its rows are garbage-collected,
+coverage is gone: a later subset request simply misses and fetches, so the
+feature can never serve stale data past a covering query's lifetime.
