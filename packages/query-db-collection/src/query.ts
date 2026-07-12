@@ -50,9 +50,9 @@ type InferSchemaInput<T> = T extends StandardSchemaV1
 type TQueryKeyBuilder<TQueryKey> = (opts: LoadSubsetOptions) => TQueryKey
 
 /**
- * Opt-in configuration for predicate-inclusion deduplication ("level 3"):
- * serving a narrower query locally from an already-loaded broader query in
- * on-demand mode (e.g. `language='hin' AND difficulty='hard'` from a live
+ * Opt-in configuration for predicate-inclusion deduplication: serving a
+ * narrower query locally from an already-loaded broader query in on-demand
+ * mode (e.g. `language='hin' AND difficulty='hard'` from a live
  * `language='hin'` query), instead of issuing a new request.
  *
  * Serving a subset locally is only correct if the server applies no hidden,
@@ -63,7 +63,7 @@ type TQueryKeyBuilder<TQueryKey> = (opts: LoadSubsetOptions) => TQueryKey
  * while its true result is disjoint from the loaded rows. This config declares
  * which columns are safe:
  *
- * - absent or `false` (default) — level 3 off; no behavior change.
+ * - absent or `false` (default) — deduplication off; no behavior change.
  * - `true` — every column is a faithful, monotonic filter; trust all narrowing.
  * - `Array<string>` — allowlist of inclusion-safe columns (dotted paths for
  *   nested fields). A residual touching any other column falls back to a fetch.
@@ -400,7 +400,7 @@ class QueryCollectionUtilsImpl {
 }
 
 // ===========================================================================
-// Predicate-inclusion (level 3) helpers.
+// Predicate-inclusion helpers.
 //
 // A request N can be served from an already-loaded live query L when
 // `isWhereSubset(N.where, L.where)` holds AND the *residual* — the narrowing
@@ -931,7 +931,7 @@ export function queryCollectionOptions(
   // 3. Decrements refcount and GCs rows where count reaches 0
   const queryRefCounts = new Map<string, number>()
 
-  // Predicate-inclusion (level 3) state — only consulted when `dedupeQueriesOn`
+  // Predicate-inclusion state — only consulted when `dedupeQueriesOn`
   // is set.
   // ==========================================================================
   // hashed subset-query key → stack of covering-query hashes it pinned, one
@@ -1330,7 +1330,7 @@ export function queryCollectionOptions(
     }
 
     /**
-     * Predicate-inclusion (level 3) match: find a live query whose loaded
+     * Predicate-inclusion match: find a live query whose loaded
      * predicate covers `opts` and whose residual passes the inclusion-safe
      * gate. The live observer map is the coverage source of truth (each
      * observer carries its LoadSubsetOptions in `options.meta`), so coverage
@@ -1432,7 +1432,7 @@ export function queryCollectionOptions(
         hashedQueryKey,
       )
 
-      // Predicate-inclusion short-circuit (level 3, opt-in via
+      // Predicate-inclusion short-circuit (opt-in via
       // `dedupeQueriesOn`): serve a strictly-narrower request from a live,
       // already-loaded broader query. An exact-key match is excluded — reusing
       // the request's own observer (below) is cheaper and handles the
@@ -1901,7 +1901,7 @@ export function queryCollectionOptions(
       queryRefCounts.delete(hashedQueryKey)
       effectivePersistedGcTimes.delete(hashedQueryKey)
 
-      // Level-3 bookkeeping: any pins on the removed query (or held by it as
+      // Predicate-inclusion bookkeeping: any pins on the removed query (or held by it as
       // a served subset) are void — the refcounts a pin represented die with
       // the query. Coverage needs no bookkeeping: it lives in the observer
       // map, and the observer was just deleted.
@@ -1983,7 +1983,7 @@ export function queryCollectionOptions(
         }
         unsubscribes.get(hashedQueryKey)?.()
         unsubscribes.delete(hashedQueryKey)
-        // Deleting the observer also removes this query from level-3
+        // Deleting the observer also removes this query from predicate-inclusion
         // coverage: retained rows are placeholders pending revalidation and
         // must not serve predicate-inclusion matches.
         state.observers.delete(hashedQueryKey)
@@ -2076,7 +2076,7 @@ export function queryCollectionOptions(
       const key = generateQueryKeyFromOptions(options)
       const hashedQueryKey = hashKey(key)
 
-      // A subset served via predicate inclusion (level 3) has no observer of
+      // A subset served via predicate inclusion has no observer of
       // its own — it holds a pin (refcount) on its covering query instead.
       // Release the pin rather than decrementing the subset's own key.
       const pins = servedByCoveringQuery.get(hashedQueryKey)

@@ -6631,7 +6631,7 @@ describe(`QueryCollection`, () => {
     })
   })
 
-  describe(`Predicate-inclusion dedupe (level 3, on-demand)`, () => {
+  describe(`Predicate-inclusion dedupe (on-demand)`, () => {
     interface ContentItem {
       id: number
       language: string
