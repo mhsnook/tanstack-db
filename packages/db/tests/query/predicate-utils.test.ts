@@ -486,6 +486,59 @@ describe(`isWhereSubset`, () => {
       ).toBe(false)
     })
   })
+
+  describe(`nested field paths`, () => {
+    it(`should handle same nested path: author.age > 20 is subset of author.age > 10`, () => {
+      expect(
+        isWhereSubset(
+          gt(ref([`author`, `age`]), val(20)),
+          gt(ref([`author`, `age`]), val(10)),
+        ),
+      ).toBe(true)
+    })
+
+    it(`should not relate a nested path to a top-level field with the same leaf`, () => {
+      // author.age and age are different fields (the path lengths differ).
+      expect(
+        isWhereSubset(
+          gt(ref([`author`, `age`]), val(20)),
+          gt(ref(`age`), val(10)),
+        ),
+      ).toBe(false)
+    })
+
+    it(`should distinguish sibling nested fields under the same parent`, () => {
+      // author.age = 15 says nothing about author.height.
+      expect(
+        isWhereSubset(
+          eq(ref([`author`, `age`]), val(15)),
+          gt(ref([`author`, `height`]), val(10)),
+        ),
+      ).toBe(false)
+    })
+
+    it(`should handle eq vs in on a nested path: author.tier = 'gold' is subset of author.tier IN ['gold', 'silver']`, () => {
+      expect(
+        isWhereSubset(
+          eq(ref([`author`, `tier`]), val(`gold`)),
+          inOp(ref([`author`, `tier`]), [`gold`, `silver`]),
+        ),
+      ).toBe(true)
+    })
+
+    it(`should handle a nested field alongside a top-level field in an AND`, () => {
+      // (author.age > 20 AND status = 'active') is subset of author.age > 10
+      expect(
+        isWhereSubset(
+          and(
+            gt(ref([`author`, `age`]), val(20)),
+            eq(ref(`status`), val(`active`)),
+          ),
+          gt(ref([`author`, `age`]), val(10)),
+        ),
+      ).toBe(true)
+    })
+  })
 })
 
 describe(`unionWherePredicates`, () => {
@@ -630,6 +683,37 @@ describe(`unionWherePredicates`, () => {
       expect(values).toContainEqual(date1)
       expect(values).toContainEqual(date2)
       expect(values).toContainEqual(date3)
+    })
+  })
+
+  describe(`nested field paths`, () => {
+    it(`should fold eq into IN on a nested path: author.tier = 'gold' OR author.tier = 'silver' → author.tier IN ['gold', 'silver']`, () => {
+      const result = unionWherePredicates([
+        eq(ref([`author`, `tier`]), val(`gold`)),
+        eq(ref([`author`, `tier`]), val(`silver`)),
+      ])
+      expect(result.type).toBe(`func`)
+      expect((result as Func).name).toBe(`in`)
+      // The folded predicate keeps the full nested path, not just the leaf.
+      expect(((result as Func).args[0] as PropRef).path).toEqual([
+        `author`,
+        `tier`,
+      ])
+      const values = ((result as Func).args[1] as Value).value
+      expect(values).toContain(`gold`)
+      expect(values).toContain(`silver`)
+      expect(values.length).toBe(2)
+    })
+
+    it(`should keep same-leaf fields under different parents as separate OR branches`, () => {
+      // author.tier and editor.tier are different fields — do not fold into one IN.
+      const result = unionWherePredicates([
+        eq(ref([`author`, `tier`]), val(`gold`)),
+        eq(ref([`editor`, `tier`]), val(`silver`)),
+      ])
+      expect(result.type).toBe(`func`)
+      expect((result as Func).name).toBe(`or`)
+      expect((result as Func).args.length).toBe(2)
     })
   })
 })
@@ -1448,6 +1532,37 @@ describe(`minusWherePredicates`, () => {
 
       // Requested is subset of already loaded - nothing more to fetch
       expect(needToFetch).toEqual({ type: `val`, value: false })
+    })
+  })
+
+  describe(`nested field paths`, () => {
+    it(`should remove a value from an IN on a nested path: author.tier IN [gold, silver, bronze] - eq(silver) = IN [gold, bronze]`, () => {
+      const from = inOp(ref([`author`, `tier`]), [`gold`, `silver`, `bronze`])
+      const subtract = eq(ref([`author`, `tier`]), val(`silver`))
+      const result = minusWherePredicates(from, subtract)
+
+      expect(result).toEqual({
+        type: `func`,
+        name: `in`,
+        args: [ref([`author`, `tier`]), val([`gold`, `bronze`])],
+      })
+    })
+
+    it(`should return empty set when the nested-path subset is fully covered`, () => {
+      const from = gt(ref([`author`, `age`]), val(20))
+      const subtract = gt(ref([`author`, `age`]), val(10))
+      const result = minusWherePredicates(from, subtract)
+
+      expect(result).toEqual({ type: `val`, value: false })
+    })
+
+    it(`should treat a nested path and a same-leaf top-level field as different fields`, () => {
+      // Can't simplify author.age against age — different fields, so fetch in full.
+      const from = gt(ref([`author`, `age`]), val(10))
+      const subtract = gt(ref(`age`), val(5))
+      const result = minusWherePredicates(from, subtract)
+
+      expect(result).toBeNull()
     })
   })
 })
