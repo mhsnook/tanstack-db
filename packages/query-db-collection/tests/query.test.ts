@@ -6665,8 +6665,8 @@ describe(`QueryCollection`, () => {
       return found
     }
 
-    // A server with a hidden, non-monotonic filter (design doc §3): archived
-    // rows are excluded unless the query mentions `archived` explicitly. This
+    // A server with a hidden, non-monotonic filter: archived rows are excluded
+    // unless the query mentions `archived` explicitly. This
     // makes `language='hin' AND archived=true` algebraically a subset of
     // `language='hin'` while its true result is disjoint from the loaded rows.
     const makeServerQueryFn = () =>
@@ -7113,7 +7113,7 @@ describe(`QueryCollection`, () => {
       ])
 
       // A limited load is not a complete partition, so it cannot cover
-      // narrower predicates (MVP skips it conservatively).
+      // narrower predicates; skip it conservatively.
       const limited = createLiveQueryCollection({
         query: (q) =>
           q

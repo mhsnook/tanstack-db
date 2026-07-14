@@ -399,18 +399,14 @@ class QueryCollectionUtilsImpl {
   }
 }
 
-// ===========================================================================
 // Predicate-inclusion helpers.
 //
 // A request N can be served from an already-loaded live query L when
-// `isWhereSubset(N.where, L.where)` holds AND the *residual* — the narrowing
-// N applies on top of L, which runs locally against L's rows instead of on
-// the server — touches only columns the developer declared inclusion-safe
-// via `dedupeQueriesOn`. The subset check alone is not sufficient: the server
-// is opaque and may apply hidden non-monotonic filters (soft-delete, auth,
-// default scopes), so narrowing on such a column can select rows the broader
-// response never contained.
-// ===========================================================================
+// `isWhereSubset(N.where, L.where)` holds AND the *residual* — the narrowing N
+// applies locally on top of L — touches only columns the developer declared
+// inclusion-safe via `dedupeQueriesOn`. The subset check alone isn't enough:
+// the server may apply hidden non-monotonic filters (soft-delete, auth, default
+// scopes), so narrowing on such a column can select rows L never contained.
 
 /** Split a where clause into its top-level conjuncts, flattening nested `and`s. */
 const flattenAndConjuncts = (
@@ -452,7 +448,7 @@ const collectReferencedColumns = (expr: IR.BasicExpression): Array<string> => {
 }
 
 /**
- * The §3 correctness gate: is every residual conjunct safe to apply as a
+ * The correctness gate: is every residual conjunct safe to apply as a
  * local filter, per the collection's `dedupeQueriesOn` declaration? (The
  * blanket `true` form is short-circuited by the caller before the residual
  * is computed.) Errs toward `false` (fetch): a conjunct referencing no
@@ -781,13 +777,11 @@ export function queryCollectionOptions(
     throw new GetKeyRequiredError()
   }
 
-  // ===========================================================================
-  // NOTE: everything down to extractKeyLookupValues exists ONLY because a
-  // collection has no `collection.key` to read — the key is an opaque
-  // `getKey(item)` function. So we reverse-engineer the key's field path by
-  // running getKey against a proxy. If collections ever expose the key path,
-  // delete getKeyFieldPath and read it directly.
-  // ===========================================================================
+  // Everything down to extractKeyLookupValues exists only because a collection
+  // has no `collection.key` to read — the key is an opaque `getKey(item)`
+  // function, so we reverse-engineer the key's field path by running getKey
+  // against a proxy. If collections ever expose the key path, delete
+  // getKeyFieldPath and read it directly.
 
   // getKey's field path (e.g. ['id']), derived once and cached. Tri-state:
   // undefined = not computed; null = composite/derived key we can't reduce to a
@@ -931,9 +925,7 @@ export function queryCollectionOptions(
   // 3. Decrements refcount and GCs rows where count reaches 0
   const queryRefCounts = new Map<string, number>()
 
-  // Predicate-inclusion state — only consulted when `dedupeQueriesOn`
-  // is set.
-  // ==========================================================================
+  // Predicate-inclusion state — only consulted when `dedupeQueriesOn` is set.
   // hashed subset-query key → stack of covering-query hashes it pinned, one
   // entry per loadSubset call served via inclusion. A served subset holds a
   // refcount on its covering query (not on itself: it has no observer), so the
@@ -1349,9 +1341,9 @@ export function queryCollectionOptions(
         if (!loaded) {
           continue
         }
-        // MVP: only an unlimited, un-windowed load is a complete partition a
-        // narrower predicate can safely be answered from (§7.5: a future
-        // "fully loaded" flag could admit chunked partitions too).
+        // Only an unlimited, un-windowed load is a complete partition a
+        // narrower predicate can safely be answered from. A future "fully
+        // loaded" flag could admit chunked partitions too.
         if (
           loaded.limit !== undefined ||
           loaded.offset !== undefined ||
@@ -1359,8 +1351,8 @@ export function queryCollectionOptions(
         ) {
           continue
         }
-        // Only serve from data that has actually landed (§5.4: still-loading
-        // covering queries are skipped; the subset fetches its own data).
+        // Only serve from data that has actually landed: still-loading covering
+        // queries are skipped, and the subset fetches its own data.
         if (!observer.getCurrentResult().isSuccess) {
           continue
         }
@@ -1448,7 +1440,7 @@ export function queryCollectionOptions(
         const coveringHash = findCoveringQueryHash(opts)
         if (coveringHash !== undefined) {
           // Pin the covering query: the subset now depends on its rows, so it
-          // must hold them live until the subset itself unloads (§5.3).
+          // must hold them live until the subset itself unloads.
           incrementQueryRefCount(coveringHash)
           const pins = servedByCoveringQuery.get(hashedQueryKey) ?? []
           pins.push(coveringHash)
