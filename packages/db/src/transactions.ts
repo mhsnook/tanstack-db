@@ -224,6 +224,8 @@ class Transaction<T extends object = Record<string, unknown>> {
    * that backend observation before returning.
    */
   public isPersisted: Deferred<Transaction<T>>
+  public isAcknowledged: Deferred<Transaction<T>>
+  public acknowledged: boolean
   public autoCommit: boolean
   public createdAt: Date
   public sequenceNumber: number
@@ -242,6 +244,11 @@ class Transaction<T extends object = Record<string, unknown>> {
     this.state = `pending`
     this.mutations = []
     this.isPersisted = createDeferred<Transaction<T>>()
+    this.isAcknowledged = createDeferred<Transaction<T>>()
+    this.acknowledged = false
+    // Prevent unhandled-rejection noise when nobody awaits isAcknowledged on a
+    // failing transaction; explicit awaiters still observe the rejection.
+    void this.isAcknowledged.promise.catch(() => {})
     this.autoCommit = config.autoCommit ?? true
     this.createdAt = new Date()
     this.sequenceNumber = sequenceNumber++
@@ -439,7 +446,11 @@ class Transaction<T extends object = Record<string, unknown>> {
       }
     }
 
-    // Reject the promise
+    // Reject the promises. A failed transaction was never acknowledged (unless
+    // the ack already arrived before the failure).
+    if (this.isAcknowledged.isPending()) {
+      this.isAcknowledged.reject(this.error?.error)
+    }
     this.isPersisted.reject(this.error?.error)
     this.touchCollection()
 
@@ -461,6 +472,46 @@ class Transaction<T extends object = Record<string, unknown>> {
         hasCalled.add(mutation.collection.id)
       }
     }
+  }
+
+  /**
+   * Mark this transaction as *acknowledged* by the server — the write was
+   * accepted — without waiting for it to sync back ("settle").
+   *
+   * Collection adapters for backends with realtime sync call this as soon as the
+   * server confirms the write but before the change echoes back through sync. It
+   * resolves {@link Transaction.isAcknowledged} and flips the `$acknowledged`
+   * virtual property on the affected rows, letting UIs respond to the ack without
+   * waiting for the echo.
+   *
+   * This is purely additive: it does not change when the handler resolves, the
+   * optimistic overlay, or `isPersisted`/`$synced`. No-op if the transaction has
+   * already been acknowledged, completed, or failed.
+   * @returns This transaction for chaining
+   */
+  acknowledge(): Transaction<T> {
+    if (
+      this.acknowledged ||
+      this.state === `completed` ||
+      this.state === `failed`
+    ) {
+      return this
+    }
+
+    this.acknowledged = true
+    this.isAcknowledged.resolve(this)
+
+    // Notify each affected collection so it flips $acknowledged and emits updates.
+    const notified = new Set<string>()
+    for (const mutation of this.mutations) {
+      if (notified.has(mutation.collection.id)) {
+        continue
+      }
+      notified.add(mutation.collection.id)
+      mutation.collection._state.onTransactionAcknowledged(this)
+    }
+
+    return this
   }
 
   /**
@@ -511,6 +562,10 @@ class Transaction<T extends object = Record<string, unknown>> {
 
     if (this.mutations.length === 0) {
       this.setState(`completed`)
+      if (this.isAcknowledged.isPending()) {
+        this.acknowledged = true
+        this.isAcknowledged.resolve(this)
+      }
       this.isPersisted.resolve(this)
 
       return this
@@ -528,6 +583,13 @@ class Transaction<T extends object = Record<string, unknown>> {
       this.setState(`completed`)
       this.touchCollection()
 
+      // A settled write is necessarily acknowledged. If the collection adapter
+      // never called acknowledge() (e.g. it has no separate ack), the two
+      // milestones coincide here.
+      if (this.isAcknowledged.isPending()) {
+        this.acknowledged = true
+        this.isAcknowledged.resolve(this)
+      }
       this.isPersisted.resolve(this)
     } catch (error) {
       // Preserve the original error for rethrowing

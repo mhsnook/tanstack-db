@@ -883,6 +883,9 @@ export function electricCollectionOptions<T extends Row<unknown>>(
         >,
       ) => {
         const handlerResult = await config.onInsert!(params)
+        // The server has accepted the write (ack). Flip $acknowledged now so UIs
+        // can respond, before waiting for the change to sync back (settle).
+        params.transaction.acknowledge()
         await processMatchingStrategy(handlerResult)
         return handlerResult
       }
@@ -897,6 +900,7 @@ export function electricCollectionOptions<T extends Row<unknown>>(
         >,
       ) => {
         const handlerResult = await config.onUpdate!(params)
+        params.transaction.acknowledge()
         await processMatchingStrategy(handlerResult)
         return handlerResult
       }
@@ -911,6 +915,7 @@ export function electricCollectionOptions<T extends Row<unknown>>(
         >,
       ) => {
         const handlerResult = await config.onDelete!(params)
+        params.transaction.acknowledge()
         await processMatchingStrategy(handlerResult)
         return handlerResult
       }
